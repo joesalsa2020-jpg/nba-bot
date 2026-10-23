@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (Full Game)
+Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3)
 Cada usuario pone SU TheOddsAPI key y SU Telegram.
-El backend vigila solo los partidos que cada usuario marco.
 """
 import os, sqlite3, requests
 from datetime import datetime
@@ -30,6 +29,7 @@ def init_db():
             tg_token TEXT DEFAULT "",
             tg_chat_id TEXT DEFAULT "",
             active INTEGER DEFAULT 0,
+            auto_mode INTEGER DEFAULT 0,
             created_at TEXT);
         CREATE TABLE IF NOT EXISTS selection(
             user_id TEXT, matchup TEXT, active INTEGER, sent INTEGER DEFAULT 0,
@@ -40,6 +40,11 @@ def init_db():
             proyeccion REAL, diff REAL, confianza INTEGER,
             total INTEGER, period INTEGER, created_at TEXT);
         """)
+        # Añadir columna auto_mode si la base de datos ya existía
+        try:
+            con.execute("ALTER TABLE users ADD COLUMN auto_mode INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
 
 def espn_games():
     try:
@@ -147,33 +152,29 @@ def send_tg(token, chat_id, msg):
     except Exception:
         return False
 
-def format_signal(matchup, g, ln, decision, proj, diff, conf):
+def format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False):
     arrow = "⬆️ OVER" if decision == "OVER" else "⬇️ UNDER"
     cuota = ln["over"] if decision == "OVER" else ln["under"]
     cuota_str = f"{cuota:.2f}" if cuota else "N/A"
     color = "🟢" if decision == "OVER" else "🔴"
+    modo = "AUTO (HT / Q3)" if auto else "FULL GAME"
     
     return (
-        f"📡 <b>SEÑAL EN VIVO — NBA (FULL GAME)</b>\n\n"
+        f"📡 <b>SEÑAL EN VIVO — NBA ({modo})</b>\n\n"
         f"🏀 <b>{matchup}</b>\n"
         f"📌 <b>Línea Totales:</b> {ln['line']:.1f}\n"
         f"⏱️ <b>Estado:</b> P{g['period']} ({g['clock']})\n\n"
-        f"📈 <b>Proyección final (ajustada):</b> {proj:.1f}\n"
+        f"📈 <b>Proyección final:</b> {proj:.1f}\n"
         f"💡 <b>Recomendación:</b> <b>{arrow} {ln['line']:.1f}</b>\n"
         f"🪙 <b>Cuota @{cuota_str}</b>\n"
         f"{color} <b>Confianza:</b> {conf}%\n\n"
-        f"🕑 <i>Señal generada automáticamente (Full Game).</i>"
+        f"🕑 <i>Señal generada automáticamente.</i>"
     )
 
 def poll():
     try:
         with db() as con:
-            users = con.execute("""
-                SELECT DISTINCT u.id, u.odds_key, u.tg_token, u.tg_chat_id
-                FROM users u
-                JOIN selection s ON s.user_id = u.id
-                WHERE u.active = 1 AND s.active = 1 AND s.sent = 0
-            """).fetchall()
+            users = con.execute("SELECT * FROM users WHERE active = 1").fetchall()
             
         if not users:
             return
@@ -184,57 +185,115 @@ def poll():
 
         for u in users:
             try:
-                with db() as con:
-                    sel = [r["matchup"] for r in con.execute(
-                        "SELECT matchup FROM selection "
-                        "WHERE user_id=? AND active=1 AND sent=0", (u["id"],))]
-                
-                live = [m for m in sel if m in games and games[m]["state"] == "in" and "Half" not in games[m]["status"] and "End" not in games[m]["status"]]
-                if not live:
-                    continue
-
-                odds = odds_totals(u["odds_key"])
-                for matchup in live:
-                    g = games[matchup]
-                    ln = odds.get(matchup)
-                    if not ln:
-                        continue
-                    mins = minutes_played(g["period"], g["clock"], g["status"])
-                    proj = project_total(g["total"], mins, g["period"])
-                    if proj is None:
-                        continue
-                    diff = proj - ln["line"]
-                    if abs(diff) < MIN_DIFF:
-                        continue
-
-                    decision = "OVER" if diff > 0 else "UNDER"
-                    cuota = ln["over"] if decision == "OVER" else ln["under"]
-                    conf = min(99, max(10, int((abs(diff) / 20) * 100 * (mins / 48))))
-                    msg = format_signal(matchup, g, ln, decision, proj, diff, conf)
-
-                    # 1. Guardar la señal en la base de datos (Web) SIEMPRE
-                    with db() as con:
-                        con.execute(
-                            "INSERT INTO signals(user_id,matchup,decision,line,cuota,"
-                            "proyeccion,diff,confianza,total,period,created_at) "
-                            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                            (u["id"], matchup, decision, ln["line"], cuota,
-                             proj, diff, conf, g["total"], g["period"],
-                             datetime.now().isoformat()))
-                        con.execute(
-                            "UPDATE selection SET sent=1 "
-                            "WHERE user_id=? AND matchup=?", (u["id"], matchup))
-                        con.commit()
+                if u["auto_mode"]:
+                    # MODO PILOTO AUTOMÁTICO (Solo HT y Fin de Q3)
+                    target_games = []
+                    for g in games.values():
+                        is_ht = "Half" in g["status"]
+                        is_q3_end = ("End" in g["status"] and g["period"] == 3) or (g["period"] == 3 and g["clock"] in ("0.0", "0:00"))
+                        if is_ht or is_q3_end:
+                            target_games.append(g)
                     
-                    # 2. Enviar a Telegram SOLO si el usuario configuró sus datos
-                    if u["tg_token"] and u["tg_chat_id"]:
-                        if send_tg(u["tg_token"], u["tg_chat_id"], msg):
-                            print(f"[SIGNAL + TG] {u['id'][:8]} {matchup} {decision} {ln['line']:.1f}")
-                        else:
-                            print(f"[SIGNAL] {u['id'][:8]} {matchup} (Fallo envio TG)")
-                    else:
-                        print(f"[SIGNAL] {u['id'][:8]} {matchup} (Guardada solo en Web)")
+                    if not target_games:
+                        continue
                         
+                    odds = odds_totals(u["odds_key"])
+                    for g in target_games:
+                        matchup = g["matchup"]
+                        ln = odds.get(matchup)
+                        if not ln:
+                            continue
+                        
+                        current_phase = 2 if "Half" in g["status"] else 3
+                        
+                        # Verificar si ya enviamos señal en esta fase
+                        with db() as con:
+                            already_sent = con.execute(
+                                "SELECT id FROM signals WHERE user_id=? AND matchup=? AND period=?", 
+                                (u["id"], matchup, current_phase)
+                            ).fetchone()
+                        if already_sent:
+                            continue
+                            
+                        mins = minutes_played(g["period"], g["clock"], g["status"])
+                        proj = project_total(g["total"], mins, g["period"])
+                        if proj is None:
+                            continue
+                        diff = proj - ln["line"]
+                        if abs(diff) < MIN_DIFF:
+                            continue
+
+                        decision = "OVER" if diff > 0 else "UNDER"
+                        cuota = ln["over"] if decision == "OVER" else ln["under"]
+                        conf = min(99, max(10, int((abs(diff) / 20) * 100 * (mins / 48))))
+                        msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=True)
+
+                        with db() as con:
+                            con.execute(
+                                "INSERT INTO signals(user_id,matchup,decision,line,cuota,"
+                                "proyeccion,diff,confianza,total,period,created_at) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (u["id"], matchup, decision, ln["line"], cuota,
+                                 proj, diff, conf, g["total"], g["period"],
+                                 datetime.now().isoformat()))
+                            con.commit()
+                        
+                        if u["tg_token"] and u["tg_chat_id"]:
+                            if send_tg(u["tg_token"], u["tg_chat_id"], msg):
+                                print(f"[AUTO SIGNAL + TG] {u['id'][:8]} {matchup} {decision} {ln['line']:.1f}")
+                        else:
+                            print(f"[AUTO SIGNAL] {u['id'][:8]} {matchup} {decision} {ln['line']:.1f} (Web)")
+                else:
+                    # MODO MANUAL (Partidos seleccionados)
+                    with db() as con:
+                        sel = [r["matchup"] for r in con.execute(
+                            "SELECT matchup FROM selection "
+                            "WHERE user_id=? AND active=1 AND sent=0", (u["id"],))]
+                    
+                    live = [m for m in sel if m in games and games[m]["state"] == "in" and "Half" not in games[m]["status"] and "End" not in games[m]["status"]]
+                    if not live:
+                        continue
+
+                    odds = odds_totals(u["odds_key"])
+                    for matchup in live:
+                        g = games[matchup]
+                        ln = odds.get(matchup)
+                        if not ln:
+                            continue
+                        mins = minutes_played(g["period"], g["clock"], g["status"])
+                        proj = project_total(g["total"], mins, g["period"])
+                        if proj is None:
+                            continue
+                        diff = proj - ln["line"]
+                        if abs(diff) < MIN_DIFF:
+                            continue
+
+                        decision = "OVER" if diff > 0 else "UNDER"
+                        cuota = ln["over"] if decision == "OVER" else ln["under"]
+                        conf = min(99, max(10, int((abs(diff) / 20) * 100 * (mins / 48))))
+                        msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False)
+
+                        with db() as con:
+                            con.execute(
+                                "INSERT INTO signals(user_id,matchup,decision,line,cuota,"
+                                "proyeccion,diff,confianza,total,period,created_at) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (u["id"], matchup, decision, ln["line"], cuota,
+                                 proj, diff, conf, g["total"], g["period"],
+                                 datetime.now().isoformat()))
+                            con.execute(
+                                "UPDATE selection SET sent=1 "
+                                "WHERE user_id=? AND matchup=?", (u["id"], matchup))
+                            con.commit()
+                        
+                        if u["tg_token"] and u["tg_chat_id"]:
+                            if send_tg(u["tg_token"], u["tg_chat_id"], msg):
+                                print(f"[SIGNAL + TG] {u['id'][:8]} {matchup} {decision} {ln['line']:.1f}")
+                            else:
+                                print(f"[SIGNAL] {u['id'][:8]} {matchup} (Fallo envio TG)")
+                        else:
+                            print(f"[SIGNAL] {u['id'][:8]} {matchup} (Guardada solo en Web)")
+                            
             except Exception as e:
                 print(f"[poll user {u['id'][:8]}] {e}")
     except Exception as e:
@@ -265,7 +324,6 @@ def startup():
 def test_user(body: UserCfg):
     errors, tg_user = [], None
     
-    # Solo probamos Telegram si el usuario lo ingresó
     if body.tg_token:
         try:
             r = requests.get(f"https://api.telegram.org/bot{body.tg_token}/getMe", timeout=10)
@@ -319,7 +377,7 @@ def get_user(x_user_id: str = Header(None)):
         return (s[:4] + "..." + s[-4:]) if s and len(s) >= 10 else "***"
     return {"configured": True, "odds_key": mask(u["odds_key"]),
             "tg_token": mask(u["tg_token"]), "tg_chat_id": u["tg_chat_id"],
-            "active": bool(u["active"])}
+            "active": bool(u["active"]), "auto_mode": bool(u["auto_mode"])}
 
 @app.post("/api/user/toggle")
 def toggle_user(x_user_id: str = Header(None)):
@@ -333,6 +391,19 @@ def toggle_user(x_user_id: str = Header(None)):
         con.execute("UPDATE users SET active=? WHERE id=?", (new_state, x_user_id))
         con.commit()
     return {"active": bool(new_state)}
+
+@app.post("/api/user/toggle_auto")
+def toggle_auto(x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(401, "No user id")
+    with db() as con:
+        u = con.execute("SELECT auto_mode FROM users WHERE id=?", (x_user_id,)).fetchone()
+        if not u:
+            raise HTTPException(404, "not configured")
+        new_state = 0 if u["auto_mode"] else 1
+        con.execute("UPDATE users SET auto_mode=? WHERE id=?", (new_state, x_user_id))
+        con.commit()
+    return {"auto_mode": bool(new_state)}
 
 @app.get("/api/games")
 def games(x_user_id: str = Header(None)):
@@ -396,7 +467,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-title" content="NBA Signals">
 <title>NBA Signals</title>
 <style>
-  :root{--bg:#0f172a;--card:#1e293b;--txt:#e2e8f0;--muted:#94a3b8;--blue:#3b82f6;--green:#22c55e;--red:#ef4444;}
+  :root{--bg:#0f172a;--card:#1e293b;--txt:#e2e8f0;--muted:#94a3b8;--blue:#3b82f6;--green:#22c55e;--red:#ef4444;--purple:#8b5cf6;}
   *{box-sizing:border-box;}
   body{font-family:-apple-system,system-ui;margin:0;padding:16px;background:var(--bg);color:var(--txt);}
   header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}
@@ -448,10 +519,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 
 <div id="main" class="hidden">
-  <button id="vigilanciaBtn" class="primary" style="background:#ef4444; margin-bottom: 20px;" onclick="toggleVigilancia()">
+  <button id="vigilanciaBtn" class="primary" style="background:#ef4444; margin-bottom: 8px;" onclick="toggleVigilancia()">
     🔴 VIGILANCIA APAGADA (Haz clic para encender)
   </button>
-  <h2>Partidos</h2>
+  <button id="autoBtn" class="primary" style="background:#475569; margin-bottom: 20px;" onclick="toggleAuto()">
+    🎯 PILOTO AUTOMÁTICO APAGADO (Solo HT & Fin Q3)
+  </button>
+  <h2>Partidos (Modo Manual)</h2>
   <div id="games" class="empty">Cargando...</div>
   <button class="primary" id="saveBtn" onclick="saveSel()">Guardar seleccion</button>
 
@@ -508,6 +582,7 @@ async function loadUser() {
       document.getElementById('tgChat').value = data.tg_chat_id || '';
       document.getElementById('oddsKey').placeholder = 'Guardada: ' + data.odds_key;
       document.getElementById('tgToken').placeholder = 'Guardado: ' + data.tg_token;
+      
       const btn = document.getElementById('vigilanciaBtn');
       if (data.active) {
         btn.style.background = '#22c55e';
@@ -516,6 +591,16 @@ async function loadUser() {
         btn.style.background = '#ef4444';
         btn.innerHTML = '🔴 VIGILANCIA APAGADA (Haz clic para encender)';
       }
+
+      const autoBtn = document.getElementById('autoBtn');
+      if (data.auto_mode) {
+        autoBtn.style.background = '#8b5cf6';
+        autoBtn.innerHTML = '🎯 PILOTO AUTOMÁTICO ENCENDIDO (Solo HT & Fin Q3)';
+      } else {
+        autoBtn.style.background = '#475569';
+        autoBtn.innerHTML = '🎯 PILOTO AUTOMÁTICO APAGADO (Solo HT & Fin Q3)';
+      }
+
       document.getElementById('main').classList.remove('hidden');
       return true;
     }
@@ -588,6 +673,7 @@ async function testUser() {
 }
 
 let selected = new Set();
+
 async function toggleVigilancia() {
   const btn = document.getElementById('vigilanciaBtn');
   btn.disabled = true;
@@ -601,6 +687,27 @@ async function toggleVigilancia() {
     } else {
       btn.style.background = '#ef4444';
       btn.innerHTML = '🔴 VIGILANCIA APAGADA (Haz clic para encender)';
+    }
+  } catch (e) {
+    console.error(e);
+    btn.innerHTML = 'Error al cambiar';
+  }
+  btn.disabled = false;
+}
+
+async function toggleAuto() {
+  const btn = document.getElementById('autoBtn');
+  btn.disabled = true;
+  btn.innerHTML = 'Cambiando...';
+  try {
+    const r = await api('/api/user/toggle_auto', {method: 'POST'});
+    const d = await r.json();
+    if (d.auto_mode) {
+      btn.style.background = '#8b5cf6';
+      btn.innerHTML = '🎯 PILOTO AUTOMÁTICO ENCENDIDO (Solo HT & Fin Q3)';
+    } else {
+      btn.style.background = '#475569';
+      btn.innerHTML = '🎯 PILOTO AUTOMÁTICO APAGADO (Solo HT & Fin Q3)';
     }
   } catch (e) {
     console.error(e);
