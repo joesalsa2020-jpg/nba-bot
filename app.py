@@ -27,8 +27,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users(
             id TEXT PRIMARY KEY,
             odds_key TEXT NOT NULL,
-            tg_token TEXT NOT NULL,
-            tg_chat_id TEXT NOT NULL,
+            tg_token TEXT DEFAULT "",
+            tg_chat_id TEXT DEFAULT "",
             active INTEGER DEFAULT 0,
             created_at TEXT);
         CREATE TABLE IF NOT EXISTS selection(
@@ -157,10 +157,8 @@ def format_signal(matchup, g, ln, decision, proj, diff, conf):
         f"📡 <b>SEÑAL EN VIVO — NBA (FULL GAME)</b>\n\n"
         f"🏀 <b>{matchup}</b>\n"
         f"📌 <b>Línea Totales:</b> {ln['line']:.1f}\n"
-        f"📊 <b>Marcador acumulado:</b> {g['total']} pts\n"
         f"⏱️ <b>Estado:</b> P{g['period']} ({g['clock']})\n\n"
         f"📈 <b>Proyección final (ajustada):</b> {proj:.1f}\n"
-        f"🔻 <b>Diferencia:</b> {diff:+.1f} pts\n"
         f"💡 <b>Recomendación:</b> <b>{arrow} {ln['line']:.1f}</b>\n"
         f"🪙 <b>Cuota @{cuota_str}</b>\n"
         f"{color} <b>Confianza:</b> {conf}%\n\n"
@@ -170,12 +168,13 @@ def format_signal(matchup, g, ln, decision, proj, diff, conf):
 def poll():
     try:
         with db() as con:
-                    users = con.execute("""
-            SELECT DISTINCT u.id, u.odds_key, u.tg_token, u.tg_chat_id
-            FROM users u
-            JOIN selection s ON s.user_id = u.id
-            WHERE u.active = 1 AND s.active = 1 AND s.sent = 0
-        """).fetchall()
+            users = con.execute("""
+                SELECT DISTINCT u.id, u.odds_key, u.tg_token, u.tg_chat_id
+                FROM users u
+                JOIN selection s ON s.user_id = u.id
+                WHERE u.active = 1 AND s.active = 1 AND s.sent = 0
+            """).fetchall()
+            
         if not users:
             return
 
@@ -189,6 +188,7 @@ def poll():
                     sel = [r["matchup"] for r in con.execute(
                         "SELECT matchup FROM selection "
                         "WHERE user_id=? AND active=1 AND sent=0", (u["id"],))]
+                
                 live = [m for m in sel if m in games and games[m]["state"] == "in" and "Half" not in games[m]["status"] and "End" not in games[m]["status"]]
                 if not live:
                     continue
@@ -212,22 +212,29 @@ def poll():
                     conf = min(99, max(10, int((abs(diff) / 20) * 100 * (mins / 48))))
                     msg = format_signal(matchup, g, ln, decision, proj, diff, conf)
 
-                    if send_tg(u["tg_token"], u["tg_chat_id"], msg):
-                        with db() as con:
-                            con.execute(
-                                "INSERT INTO signals(user_id,matchup,decision,line,cuota,"
-                                "proyeccion,diff,confianza,total,period,created_at) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                                (u["id"], matchup, decision, ln["line"], cuota,
-                                 proj, diff, conf, g["total"], g["period"],
-                                 datetime.now().isoformat()))
-                            con.execute(
-                                "UPDATE selection SET sent=1 "
-                                "WHERE user_id=? AND matchup=?", (u["id"], matchup))
-                            con.commit()
-                        print(f"[SIGNAL] {u['id'][:8]} {matchup} {decision} {ln['line']:.1f}")
+                    # 1. Guardar la señal en la base de datos (Web) SIEMPRE
+                    with db() as con:
+                        con.execute(
+                            "INSERT INTO signals(user_id,matchup,decision,line,cuota,"
+                            "proyeccion,diff,confianza,total,period,created_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (u["id"], matchup, decision, ln["line"], cuota,
+                             proj, diff, conf, g["total"], g["period"],
+                             datetime.now().isoformat()))
+                        con.execute(
+                            "UPDATE selection SET sent=1 "
+                            "WHERE user_id=? AND matchup=?", (u["id"], matchup))
+                        con.commit()
+                    
+                    # 2. Enviar a Telegram SOLO si el usuario configuró sus datos
+                    if u["tg_token"] and u["tg_chat_id"]:
+                        if send_tg(u["tg_token"], u["tg_chat_id"], msg):
+                            print(f"[SIGNAL + TG] {u['id'][:8]} {matchup} {decision} {ln['line']:.1f}")
+                        else:
+                            print(f"[SIGNAL] {u['id'][:8]} {matchup} (Fallo envio TG)")
                     else:
-                        print(f"[TG FAIL] {u['id'][:8]} {matchup}")
+                        print(f"[SIGNAL] {u['id'][:8]} {matchup} (Guardada solo en Web)")
+                        
             except Exception as e:
                 print(f"[poll user {u['id'][:8]}] {e}")
     except Exception as e:
@@ -238,8 +245,8 @@ def poll():
 # =========================
 class UserCfg(BaseModel):
     odds_key: str
-    tg_token: str
-    tg_chat_id: str
+    tg_token: str = ""
+    tg_chat_id: str = ""
 
 class Sel(BaseModel):
     matchups: list
@@ -257,15 +264,18 @@ def startup():
 @app.post("/api/user/test")
 def test_user(body: UserCfg):
     errors, tg_user = [], None
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{body.tg_token}/getMe", timeout=10)
-        d = r.json()
-        if r.status_code == 200 and d.get("ok"):
-            tg_user = d["result"]["username"]
-        else:
-            errors.append(f"Telegram invalido ({r.status_code})")
-    except Exception as e:
-        errors.append(f"Telegram: {e}")
+    
+    # Solo probamos Telegram si el usuario lo ingresó
+    if body.tg_token:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{body.tg_token}/getMe", timeout=10)
+            d = r.json()
+            if r.status_code == 200 and d.get("ok"):
+                tg_user = d["result"]["username"]
+            else:
+                errors.append(f"Telegram invalido ({r.status_code})")
+        except Exception as e:
+            errors.append(f"Telegram: {e}")
 
     remaining = None
     try:
@@ -422,11 +432,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="card">
     <h2>Tus credenciales</h2>
     <p class="hint">Cada usuario usa sus propias claves. Se guardan en este servidor.</p>
-    <label class="hint">TheOddsAPI key</label>
+    <label class="hint">TheOddsAPI key (Obligatoria)</label>
     <input class="field" id="oddsKey" placeholder="ej: 8685233a768b4d44...">
-    <label class="hint">Telegram bot token</label>
+    <label class="hint">Telegram bot token (Opcional)</label>
     <input class="field" id="tgToken" placeholder="ej: 7726757580:AAH...">
-    <label class="hint">Telegram chat ID</label>
+    <label class="hint">Telegram chat ID (Opcional)</label>
     <input class="field" id="tgChat" placeholder="ej: 1058217995">
     <button class="primary" onclick="saveUser()">Guardar credenciales</button>
     <button class="secondary" onclick="testUser()">Probar credenciales</button>
@@ -498,14 +508,14 @@ async function loadUser() {
       document.getElementById('tgChat').value = data.tg_chat_id || '';
       document.getElementById('oddsKey').placeholder = 'Guardada: ' + data.odds_key;
       document.getElementById('tgToken').placeholder = 'Guardado: ' + data.tg_token;
-                  const btn = document.getElementById('vigilanciaBtn');
-            if (data.active) {
-              btn.style.background = '#22c55e';
-              btn.innerHTML = '🟢 VIGILANCIA ENCENDIDA (Haz clic para apagar)';
-            } else {
-              btn.style.background = '#ef4444';
-              btn.innerHTML = '🔴 VIGILANCIA APAGADA (Haz clic para encender)';
-            }
+      const btn = document.getElementById('vigilanciaBtn');
+      if (data.active) {
+        btn.style.background = '#22c55e';
+        btn.innerHTML = '🟢 VIGILANCIA ENCENDIDA (Haz clic para apagar)';
+      } else {
+        btn.style.background = '#ef4444';
+        btn.innerHTML = '🔴 VIGILANCIA APAGADA (Haz clic para encender)';
+      }
       document.getElementById('main').classList.remove('hidden');
       return true;
     }
@@ -518,11 +528,18 @@ async function saveUser() {
   const tk = document.getElementById('tgToken').value.trim();
   const chat = document.getElementById('tgChat').value.trim();
   const msg = document.getElementById('settingsMsg');
-  if (!odds || !tk || !chat) {
+  
+  if (!odds) {
     msg.className = 'msg err';
-    msg.textContent = 'Rellena los 3 campos';
+    msg.textContent = 'La clave de TheOddsAPI es obligatoria';
     return;
   }
+  if ((tk && !chat) || (!tk && chat)) {
+    msg.className = 'msg err';
+    msg.textContent = 'Si usas Telegram, debes llenar Token y Chat ID';
+    return;
+  }
+
   const r = await api('/api/user', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -545,11 +562,13 @@ async function testUser() {
   const tk = document.getElementById('tgToken').value.trim();
   const chat = document.getElementById('tgChat').value.trim();
   const msg = document.getElementById('settingsMsg');
-  if (!odds || !tk || !chat) {
+  
+  if (!odds) {
     msg.className = 'msg err';
-    msg.textContent = 'Rellena los 3 campos primero';
+    msg.textContent = 'La clave de TheOddsAPI es obligatoria';
     return;
   }
+  
   msg.className = 'msg';
   msg.textContent = 'Probando...';
   const r = await api('/api/user/test', {
@@ -560,7 +579,8 @@ async function testUser() {
   const d = await r.json();
   if (d.ok) {
     msg.className = 'msg ok';
-    msg.innerHTML = 'OK<br>Bot: @' + d.tg_user + '<br>Creditos restantes: ' + d.odds_remaining;
+    let extra = d.tg_user ? '<br>Bot: @' + d.tg_user : '<br>Telegram: No configurado';
+    msg.innerHTML = 'OK' + extra + '<br>Creditos restantes: ' + d.odds_remaining;
   } else {
     msg.className = 'msg err';
     msg.textContent = 'Error: ' + d.errors.join(' | ');
