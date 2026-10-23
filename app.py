@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3 + Panel Admin)
-Cada usuario pone SU TheOddsAPI key y SU Telegram.
+Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3 + Panel Admin + Estadísticas)
 """
 import os, sqlite3, requests
 from datetime import datetime
@@ -40,15 +39,24 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT, matchup TEXT, decision TEXT, line REAL, cuota REAL,
             proyeccion REAL, diff REAL, confianza INTEGER,
-            total INTEGER, period INTEGER, created_at TEXT);
+            total INTEGER, period INTEGER, created_at TEXT,
+            status TEXT DEFAULT 'PENDING',
+            final_total INTEGER);
         """)
-        # Añadir columnas si la base de datos ya existía
         try:
             con.execute("ALTER TABLE users ADD COLUMN auto_mode INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:
             con.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            con.execute("ALTER TABLE signals ADD COLUMN status TEXT DEFAULT 'PENDING'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            con.execute("ALTER TABLE signals ADD COLUMN final_total INTEGER")
         except sqlite3.OperationalError:
             pass
 
@@ -177,12 +185,42 @@ def format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False):
         f"🕑 <i>Señal generada automáticamente.</i>"
     )
 
+def check_results():
+    """Revisa en ESPN si los partidos con señales pendientes ya terminaron para calificar la apuesta."""
+    try:
+        with db() as con:
+            pending = con.execute("SELECT * FROM signals WHERE status='PENDING'").fetchall()
+        if not pending:
+            return
+            
+        games = {g["matchup"]: g for g in espn_games()}
+        for sig in pending:
+            g = games.get(sig["matchup"])
+            # Si el partido terminó (estado "post" o status contiene "Final")
+            if g and (g["state"] == "post" or "Final" in g["status"] or "End" in g["status"]):
+                final_total = g["total"]
+                line = sig["line"]
+                decision = sig["decision"]
+                status = "PUSH"
+                
+                if decision == "OVER":
+                    if final_total > line: status = "WON"
+                    elif final_total < line: status = "LOST"
+                elif decision == "UNDER":
+                    if final_total < line: status = "WON"
+                    elif final_total > line: status = "LOST"
+                
+                with db() as con:
+                    con.execute("UPDATE signals SET status=?, final_total=? WHERE id=?", (status, final_total, sig["id"]))
+                    con.commit()
+                print(f"[RESULT] {sig['matchup']} {decision} {line} -> Final {final_total} ({status})")
+    except Exception as e:
+        print(f"[check_results error] {e}")
+
 def poll():
     try:
         with db() as con:
-            # Solo usuarios activos, NO bloqueados
             users = con.execute("SELECT * FROM users WHERE active = 1 AND is_blocked = 0").fetchall()
-            
         if not users:
             return
 
@@ -193,7 +231,6 @@ def poll():
         for u in users:
             try:
                 if u["auto_mode"]:
-                    # MODO PILOTO AUTOMÁTICO (Solo HT y Fin de Q3)
                     target_games = []
                     for g in games.values():
                         is_ht = "Half" in g["status"]
@@ -250,7 +287,6 @@ def poll():
                         else:
                             print(f"[AUTO SIGNAL] {u['id'][:8]} {matchup} {decision} {ln['line']:.1f} (Web)")
                 else:
-                    # MODO MANUAL (Partidos seleccionados)
                     with db() as con:
                         sel = [r["matchup"] for r in con.execute(
                             "SELECT matchup FROM selection "
@@ -299,7 +335,6 @@ def poll():
                                 print(f"[SIGNAL] {u['id'][:8]} {matchup} (Fallo envio TG)")
                         else:
                             print(f"[SIGNAL] {u['id'][:8]} {matchup} (Guardada solo en Web)")
-                            
             except Exception as e:
                 print(f"[poll user {u['id'][:8]}] {e}")
     except Exception as e:
@@ -323,13 +358,13 @@ def startup():
     init_db()
     sch = BackgroundScheduler()
     sch.add_job(poll, "interval", seconds=POLL_INTERVAL)
+    sch.add_job(check_results, "interval", seconds=300) # Cada 5 minutos revisa resultados
     sch.start()
     app.state.sch = sch
 
 @app.post("/api/user/test")
 def test_user(body: UserCfg):
     errors, tg_user = [], None
-    
     if body.tg_token:
         try:
             r = requests.get(f"https://api.telegram.org/bot{body.tg_token}/getMe", timeout=10)
@@ -361,11 +396,9 @@ def save_user(body: UserCfg, x_user_id: str = Header(None)):
     if not x_user_id:
         raise HTTPException(401, "No user id")
     with db() as con:
-        # Verificar si está bloqueado antes de permitir guardar
         existing = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
         if existing and existing["is_blocked"]:
             raise HTTPException(403, "Usuario bloqueado por el administrador")
-            
         con.execute(
             "INSERT INTO users(id, odds_key, tg_token, tg_chat_id, created_at) "
             "VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
@@ -386,7 +419,6 @@ def get_user(x_user_id: str = Header(None)):
         raise HTTPException(404, "not configured")
     if u["is_blocked"]:
         raise HTTPException(403, "Usuario bloqueado")
-        
     def mask(s):
         return (s[:4] + "..." + s[-4:]) if s and len(s) >= 10 else "***"
     return {"configured": True, "odds_key": mask(u["odds_key"]),
@@ -433,7 +465,6 @@ def games(x_user_id: str = Header(None)):
             raise HTTPException(404, "not configured")
         if u["is_blocked"]:
             raise HTTPException(403, "Usuario bloqueado")
-            
         sel = {r["matchup"]: dict(r) for r in con.execute(
             "SELECT * FROM selection WHERE user_id=?", (x_user_id,))}
     result = []
@@ -454,7 +485,6 @@ def set_selection(body: Sel, x_user_id: str = Header(None)):
             raise HTTPException(404, "not configured")
         if u["is_blocked"]:
             raise HTTPException(403, "Usuario bloqueado")
-            
         con.execute("UPDATE selection SET active=0 WHERE user_id=?", (x_user_id,))
         for m in body.matchups:
             row = con.execute(
@@ -479,11 +509,35 @@ def signals(x_user_id: str = Header(None)):
         u = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
         if u and u["is_blocked"]:
             raise HTTPException(403, "Usuario bloqueado")
-            
         rows = [dict(r) for r in con.execute(
             "SELECT * FROM signals WHERE user_id=? ORDER BY id DESC LIMIT 50",
             (x_user_id,))]
     return rows
+
+@app.get("/api/stats")
+def get_stats(x_user_id: str = Header(None)):
+    if not x_user_id:
+        raise HTTPException(401, "No user id")
+    with db() as con:
+        res = con.execute("""
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN status='WON' THEN 1 ELSE 0 END) as won,
+                SUM(CASE WHEN status='LOST' THEN 1 ELSE 0 END) as lost,
+                SUM(CASE WHEN status='PUSH' THEN 1 ELSE 0 END) as push
+            FROM signals WHERE user_id=?
+        """, (x_user_id,)).fetchone()
+    
+    total_valid = (res["won"] or 0) + (res["lost"] or 0)
+    win_rate = round(((res["won"] or 0) / total_valid * 100), 1) if total_valid > 0 else 0
+    
+    return {
+        "total": res["total"] or 0, 
+        "won": res["won"] or 0, 
+        "lost": res["lost"] or 0, 
+        "push": res["push"] or 0, 
+        "win_rate": win_rate
+    }
 
 # =========================
 # RUTAS DE ADMINISTRADOR
@@ -494,7 +548,6 @@ def admin_users(passwd: str = Query(None)):
         raise HTTPException(401, "Contraseña incorrecta")
     with db() as con:
         users = [dict(r) for r in con.execute("SELECT * FROM users ORDER BY created_at DESC")]
-    # Ocultar claves completas por seguridad
     for u in users:
         u["odds_key"] = (u["odds_key"][:4] + "..." + u["odds_key"][-4:]) if len(u["odds_key"]) > 8 else "***"
         u["tg_token"] = (u["tg_token"][:4] + "..." + u["tg_token"][-4:]) if u["tg_token"] and len(u["tg_token"]) > 8 else "***"
@@ -592,6 +645,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button id="autoBtn" class="primary" style="background:#475569; margin-bottom: 20px;" onclick="toggleAuto()">
     🎯 PILOTO AUTOMÁTICO APAGADO (Solo HT & Fin Q3)
   </button>
+
+  <h2>Rendimiento</h2>
+  <div id="stats" class="empty">Cargando...</div>
+
   <h2>Partidos (Modo Manual)</h2>
   <div id="games" class="empty">Cargando...</div>
   <button class="primary" id="saveBtn" onclick="saveSel()">Guardar seleccion</button>
@@ -708,6 +765,7 @@ async function saveUser() {
     await testUser();
     await loadUser();
     loadGames();
+    loadStats();
   } else {
     msg.className = 'msg err';
     msg.textContent = 'Error guardando (¿Estás bloqueado?)';
@@ -788,6 +846,30 @@ async function toggleAuto() {
   btn.disabled = false;
 }
 
+async function loadStats() {
+  try {
+    const r = await api('/api/stats');
+    if (!r.ok) return;
+    const d = await r.json();
+    const div = document.getElementById('stats');
+    
+    const color = d.win_rate >= 50 ? '#22c55e' : (d.total === 0 ? '#94a3b8' : '#ef4444');
+    
+    div.className = '';
+    div.innerHTML = `
+      <div class="card" style="text-align:center;">
+        <div style="font-size:40px; font-weight:bold; color:${color};">${d.win_rate}%</div>
+        <div style="color:#94a3b8; font-size:12px; text-transform:uppercase; letter-spacing:1px; margin-bottom:16px;">Tasa de Acierto</div>
+        <div style="display:flex; justify-content:space-around; font-size:14px;">
+          <div><span style="color:#22c55e;">✅</span> ${d.won} Ganadas</div>
+          <div><span style="color:#ef4444;">❌</span> ${d.lost} Perdidas</div>
+          <div><span style="color:#64748b;">⚖️</span> ${d.push} Empates</div>
+        </div>
+      </div>
+    `;
+  } catch (e) { console.error(e); }
+}
+
 async function loadGames() {
   try {
     const r = await api('/api/games');
@@ -848,10 +930,17 @@ async function loadSignals() {
     }
     div.className = '';
     div.innerHTML = sigs.map(function(s){
+      let statusBadge = '';
+      if (s.status === 'WON') statusBadge = '<div style="color:#22c55e; font-weight:bold; margin-top:4px;">✅ GANADA (Total final: ' + s.final_total + ')</div>';
+      else if (s.status === 'LOST') statusBadge = '<div style="color:#ef4444; font-weight:bold; margin-top:4px;">❌ PERDIDA (Total final: ' + s.final_total + ')</div>';
+      else if (s.status === 'PUSH') statusBadge = '<div style="color:#64748b; font-weight:bold; margin-top:4px;">⚖️ EMPATE (Total final: ' + s.final_total + ')</div>';
+      else statusBadge = '<div style="color:#eab308; font-weight:bold; margin-top:4px;">⏳ PENDIENTE</div>';
+
       return `<div class="card signal ${s.decision.toLowerCase()}">
         <div><b>${s.matchup}</b></div>
         <div>${s.decision} ${s.line.toFixed(1)} @ ${s.cuota ? s.cuota.toFixed(2) : 'N/A'}</div>
         <div class="meta">Proyeccion ${s.proyeccion.toFixed(1)} - Diff ${s.diff > 0 ? '+' : ''}${s.diff.toFixed(1)} - Conf ${s.confianza}%</div>
+        ${statusBadge}
         <div class="meta">${new Date(s.created_at).toLocaleString()}</div>
       </div>`;
     }).join('');
@@ -866,8 +955,10 @@ async function init() {
   if (configured) {
     loadGames();
     loadSignals();
+    loadStats();
     setInterval(loadGames, 30000);
     setInterval(loadSignals, 15000);
+    setInterval(loadStats, 60000);
   }
 }
 
