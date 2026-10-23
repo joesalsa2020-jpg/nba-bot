@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3/Q4 + Panel Admin + Estadísticas + Anti-Cruce)
+Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3/Q4 + Panel Admin + Estadísticas + Anti-Cruce + Odds Frescas)
 """
 import os, sqlite3, requests
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -100,17 +100,45 @@ def odds_totals(api_key):
         if r.status_code != 200:
             return {}
         out = {}
+        
         for m in r.json():
             matchup = f"{m['away_team']} vs {m['home_team']}"
-            bm = next((b for b in m.get("bookmakers", [])
-                       if b.get("key") == "pinnacle"), None) \
-                 or (m.get("bookmakers") or [None])[0]
-            if not bm:
+            
+            # Buscar la cuota MÁS FRESCA entre todas las casas de apuestas
+            best_bm = None
+            best_time = None
+            
+            for bm in m.get("bookmakers", []):
+                last_update_str = bm.get("last_update")
+                if not last_update_str:
+                    continue
+                try:
+                    lu = datetime.fromisoformat(last_update_str.replace('Z', '+00:00'))
+                except Exception:
+                    continue
+                
+                # Verificamos si tiene mercado de totales
+                mk = next((x for x in bm.get("markets", []) if x.get("key") == "totals"), None)
+                if not mk:
+                    continue
+                    
+                if best_time is None or lu > best_time:
+                    best_time = lu
+                    best_bm = bm
+            
+            if not best_bm:
                 continue
-            mk = next((x for x in bm.get("markets", [])
-                       if x.get("key") == "totals"), None)
-            if not mk:
+                
+            # Calcular antigüedad en minutos
+            now = datetime.now(timezone.utc)
+            minutos_viejos = (now - best_time).total_seconds() / 60.0
+            
+            # Si la cuota más fresca tiene más de 5 minutos, la ignoramos por seguridad
+            if minutos_viejos > 5:
+                print(f"[ODDS VIEJAS] {matchup} ({best_bm.get('title')}) actualizada hace {minutos_viejos:.1f} min. Ignorada.")
                 continue
+
+            mk = next((x for x in best_bm.get("markets", []) if x.get("key") == "totals"), None)
             line = over = under = None
             for o in mk.get("outcomes", []):
                 if "point" in o and "price" in o:
@@ -119,8 +147,15 @@ def odds_totals(api_key):
                         over = float(o["price"])
                     elif o.get("name", "").lower() == "under":
                         under = float(o["price"])
+                        
             if line is not None:
-                out[matchup] = {"line": line, "over": over, "under": under}
+                out[matchup] = {
+                    "line": line, 
+                    "over": over, 
+                    "under": under,
+                    "bookmaker": best_bm.get("title", "Desconocida"),
+                    "age_min": minutos_viejos
+                }
         return out
     except Exception as e:
         print(f"[odds] {e}")
@@ -172,13 +207,17 @@ def format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False):
     cuota_str = f"{cuota:.2f}" if cuota else "N/A"
     color = "🟢" if decision == "OVER" else "🔴"
     modo = "AUTO (HT/Q3/Q4)" if auto else "FULL GAME"
+    bookie = ln.get("bookmaker", "Desconocida")
+    age = ln.get("age_min", 0)
     
     return (
         f"📡 <b>SEÑAL EN VIVO — NBA ({modo})</b>\n\n"
         f"🏀 <b>{matchup}</b>\n"
-        f"📌 <b>Línea Totales:</b> {ln['line']:.1f}\n"
+        f"📌 <b>Línea ({bookie}):</b> {ln['line']:.1f}\n"
+        f"🔄 <b>Actualizada hace:</b> {age:.1f} min\n"
         f"⏱️ <b>Estado:</b> P{g['period']} ({g['clock']})\n\n"
         f"📈 <b>Proyección final:</b> {proj:.1f}\n"
+        f"🔻 <b>Diferencia:</b> {diff:+.1f} pts\n"
         f"💡 <b>Recomendación:</b> <b>{arrow} {ln['line']:.1f}</b>\n"
         f"🪙 <b>Cuota @{cuota_str}</b>\n"
         f"{color} <b>Confianza:</b> {conf}%\n\n"
@@ -263,7 +302,6 @@ def poll():
 
                         decision = "OVER" if diff > 0 else "UNDER"
                         
-                        # --- REGLA ANTI-CRUCE ---
                         with db() as con:
                             prev_sig = con.execute(
                                 "SELECT decision FROM signals WHERE user_id=? AND matchup=? ORDER BY id DESC LIMIT 1", 
@@ -273,7 +311,6 @@ def poll():
                         if prev_sig and prev_sig["decision"] != decision:
                             print(f"[SKIP CRUCE] {matchup}: Ya se envió {prev_sig['decision']}, ahora daba {decision}. Ignorado.")
                             continue
-                        # ------------------------
 
                         cuota = ln["over"] if decision == "OVER" else ln["under"]
                         conf = min(99, max(10, int((abs(diff) / 20) * 100 * (mins / 48))))
