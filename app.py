@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3 + Panel Admin + Estadísticas)
+Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3/Q4 + Panel Admin + Estadísticas + Anti-Cruce)
 """
 import os, sqlite3, requests
 from datetime import datetime
@@ -171,7 +171,7 @@ def format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False):
     cuota = ln["over"] if decision == "OVER" else ln["under"]
     cuota_str = f"{cuota:.2f}" if cuota else "N/A"
     color = "🟢" if decision == "OVER" else "🔴"
-    modo = "AUTO (HT / Q3)" if auto else "FULL GAME"
+    modo = "AUTO (HT/Q3/Q4)" if auto else "FULL GAME"
     
     return (
         f"📡 <b>SEÑAL EN VIVO — NBA ({modo})</b>\n\n"
@@ -186,30 +186,25 @@ def format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False):
     )
 
 def check_results():
-    """Revisa en ESPN si los partidos con señales pendientes ya terminaron para calificar la apuesta."""
     try:
         with db() as con:
             pending = con.execute("SELECT * FROM signals WHERE status='PENDING'").fetchall()
         if not pending:
             return
-            
         games = {g["matchup"]: g for g in espn_games()}
         for sig in pending:
             g = games.get(sig["matchup"])
-            # Si el partido terminó (estado "post" o status contiene "Final")
             if g and (g["state"] == "post" or "Final" in g["status"] or "End" in g["status"]):
                 final_total = g["total"]
                 line = sig["line"]
                 decision = sig["decision"]
                 status = "PUSH"
-                
                 if decision == "OVER":
                     if final_total > line: status = "WON"
                     elif final_total < line: status = "LOST"
                 elif decision == "UNDER":
                     if final_total < line: status = "WON"
                     elif final_total > line: status = "LOST"
-                
                 with db() as con:
                     con.execute("UPDATE signals SET status=?, final_total=? WHERE id=?", (status, final_total, sig["id"]))
                     con.commit()
@@ -220,7 +215,7 @@ def check_results():
 def poll():
     try:
         with db() as con:
-            users = con.execute("SELECT * FROM users WHERE active = 1 AND is_blocked = 0").fetchall()
+            users = con.execute("SELECT * FROM users WHERE (active = 1 OR auto_mode = 1) AND is_blocked = 0").fetchall()
         if not users:
             return
 
@@ -234,8 +229,8 @@ def poll():
                     target_games = []
                     for g in games.values():
                         is_ht = "Half" in g["status"]
-                        is_q3_end = ("End" in g["status"] and g["period"] == 3) or (g["period"] == 3 and g["clock"] in ("0.0", "0:00"))
-                        if is_ht or is_q3_end:
+                        is_q3_q4_live = (g["period"] in (3, 4) and g["state"] == "in")
+                        if is_ht or is_q3_q4_live:
                             target_games.append(g)
                     
                     if not target_games:
@@ -248,7 +243,7 @@ def poll():
                         if not ln:
                             continue
                         
-                        current_phase = 2 if "Half" in g["status"] else 3
+                        current_phase = 2 if "Half" in g["status"] else g["period"]
                         
                         with db() as con:
                             already_sent = con.execute(
@@ -267,6 +262,19 @@ def poll():
                             continue
 
                         decision = "OVER" if diff > 0 else "UNDER"
+                        
+                        # --- REGLA ANTI-CRUCE ---
+                        with db() as con:
+                            prev_sig = con.execute(
+                                "SELECT decision FROM signals WHERE user_id=? AND matchup=? ORDER BY id DESC LIMIT 1", 
+                                (u["id"], matchup)
+                            ).fetchone()
+                            
+                        if prev_sig and prev_sig["decision"] != decision:
+                            print(f"[SKIP CRUCE] {matchup}: Ya se envió {prev_sig['decision']}, ahora daba {decision}. Ignorado.")
+                            continue
+                        # ------------------------
+
                         cuota = ln["over"] if decision == "OVER" else ln["under"]
                         conf = min(99, max(10, int((abs(diff) / 20) * 100 * (mins / 48))))
                         msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=True)
@@ -358,7 +366,7 @@ def startup():
     init_db()
     sch = BackgroundScheduler()
     sch.add_job(poll, "interval", seconds=POLL_INTERVAL)
-    sch.add_job(check_results, "interval", seconds=300) # Cada 5 minutos revisa resultados
+    sch.add_job(check_results, "interval", seconds=300)
     sch.start()
     app.state.sch = sch
 
@@ -539,9 +547,6 @@ def get_stats(x_user_id: str = Header(None)):
         "win_rate": win_rate
     }
 
-# =========================
-# RUTAS DE ADMINISTRADOR
-# =========================
 @app.get("/api/admin/users")
 def admin_users(passwd: str = Query(None)):
     if passwd != ADMIN_PASS:
@@ -576,9 +581,6 @@ def admin_page(passwd: str = Query(None)):
 def index():
     return HTML_PAGE
 
-# =========================
-# HTML FRONTEND
-# =========================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
@@ -643,7 +645,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     🔴 VIGILANCIA APAGADA (Haz clic para encender)
   </button>
   <button id="autoBtn" class="primary" style="background:#475569; margin-bottom: 20px;" onclick="toggleAuto()">
-    🎯 PILOTO AUTOMÁTICO APAGADO (Solo HT & Fin Q3)
+    🎯 PILOTO AUTOMÁTICO APAGADO (HT, Q3 y Q4)
   </button>
 
   <h2>Rendimiento</h2>
@@ -724,10 +726,10 @@ async function loadUser() {
       const autoBtn = document.getElementById('autoBtn');
       if (data.auto_mode) {
         autoBtn.style.background = '#8b5cf6';
-        autoBtn.innerHTML = '🎯 PILOTO AUTOMÁTICO ENCENDIDO (Solo HT & Fin Q3)';
+        autoBtn.innerHTML = '🎯 PILOTO AUTOMÁTICO ENCENDIDO (HT, Q3 y Q4)';
       } else {
         autoBtn.style.background = '#475569';
-        autoBtn.innerHTML = '🎯 PILOTO AUTOMÁTICO APAGADO (Solo HT & Fin Q3)';
+        autoBtn.innerHTML = '🎯 PILOTO AUTOMÁTICO APAGADO (HT, Q3 y Q4)';
       }
 
       document.getElementById('main').classList.remove('hidden');
@@ -834,10 +836,10 @@ async function toggleAuto() {
     const d = await r.json();
     if (d.auto_mode) {
       btn.style.background = '#8b5cf6';
-      btn.innerHTML = '🎯 PILOTO AUTOMÁTICO ENCENDIDO (Solo HT & Fin Q3)';
+      btn.innerHTML = '🎯 PILOTO AUTOMÁTICO ENCENDIDO (HT, Q3 y Q4)';
     } else {
       btn.style.background = '#475569';
-      btn.innerHTML = '🎯 PILOTO AUTOMÁTICO APAGADO (Solo HT & Fin Q3)';
+      btn.innerHTML = '🎯 PILOTO AUTOMÁTICO APAGADO (HT, Q3 y Q4)';
     }
   } catch (e) {
     console.error(e);
