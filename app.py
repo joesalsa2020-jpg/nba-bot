@@ -233,7 +233,8 @@ def check_results():
         games = {g["matchup"]: g for g in espn_games()}
         for sig in pending:
             g = games.get(sig["matchup"])
-            if g and (g["state"] == "post" or "Final" in g["status"] or "End" in g["status"]):
+            # AQUÍ ESTÁ LA CORRECCIÓN (Solo si el estado es "post")
+            if g and g["state"] == "post":
                 final_total = g["total"]
                 line = sig["line"]
                 decision = sig["decision"]
