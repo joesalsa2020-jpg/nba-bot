@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3)
+Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3 + Panel Admin)
 Cada usuario pone SU TheOddsAPI key y SU Telegram.
 """
 import os, sqlite3, requests
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -14,6 +14,7 @@ import uvicorn
 POLL_INTERVAL = 30
 MIN_DIFF = 7.0
 DB = "nba.db"
+ADMIN_PASS = "admin123"  # 👈 CAMBIA ESTO POR TU CONTRASEÑA SECRETA
 
 def db():
     con = sqlite3.connect(DB, check_same_thread=False)
@@ -30,6 +31,7 @@ def init_db():
             tg_chat_id TEXT DEFAULT "",
             active INTEGER DEFAULT 0,
             auto_mode INTEGER DEFAULT 0,
+            is_blocked INTEGER DEFAULT 0,
             created_at TEXT);
         CREATE TABLE IF NOT EXISTS selection(
             user_id TEXT, matchup TEXT, active INTEGER, sent INTEGER DEFAULT 0,
@@ -40,9 +42,13 @@ def init_db():
             proyeccion REAL, diff REAL, confianza INTEGER,
             total INTEGER, period INTEGER, created_at TEXT);
         """)
-        # Añadir columna auto_mode si la base de datos ya existía
+        # Añadir columnas si la base de datos ya existía
         try:
             con.execute("ALTER TABLE users ADD COLUMN auto_mode INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            con.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass
 
@@ -174,7 +180,8 @@ def format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False):
 def poll():
     try:
         with db() as con:
-            users = con.execute("SELECT * FROM users WHERE active = 1").fetchall()
+            # Solo usuarios activos, NO bloqueados
+            users = con.execute("SELECT * FROM users WHERE active = 1 AND is_blocked = 0").fetchall()
             
         if not users:
             return
@@ -206,7 +213,6 @@ def poll():
                         
                         current_phase = 2 if "Half" in g["status"] else 3
                         
-                        # Verificar si ya enviamos señal en esta fase
                         with db() as con:
                             already_sent = con.execute(
                                 "SELECT id FROM signals WHERE user_id=? AND matchup=? AND period=?", 
@@ -355,6 +361,11 @@ def save_user(body: UserCfg, x_user_id: str = Header(None)):
     if not x_user_id:
         raise HTTPException(401, "No user id")
     with db() as con:
+        # Verificar si está bloqueado antes de permitir guardar
+        existing = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
+        if existing and existing["is_blocked"]:
+            raise HTTPException(403, "Usuario bloqueado por el administrador")
+            
         con.execute(
             "INSERT INTO users(id, odds_key, tg_token, tg_chat_id, created_at) "
             "VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
@@ -373,6 +384,9 @@ def get_user(x_user_id: str = Header(None)):
         u = con.execute("SELECT * FROM users WHERE id=?", (x_user_id,)).fetchone()
     if not u:
         raise HTTPException(404, "not configured")
+    if u["is_blocked"]:
+        raise HTTPException(403, "Usuario bloqueado")
+        
     def mask(s):
         return (s[:4] + "..." + s[-4:]) if s and len(s) >= 10 else "***"
     return {"configured": True, "odds_key": mask(u["odds_key"]),
@@ -384,9 +398,11 @@ def toggle_user(x_user_id: str = Header(None)):
     if not x_user_id:
         raise HTTPException(401, "No user id")
     with db() as con:
-        u = con.execute("SELECT active FROM users WHERE id=?", (x_user_id,)).fetchone()
+        u = con.execute("SELECT active, is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
         if not u:
             raise HTTPException(404, "not configured")
+        if u["is_blocked"]:
+            raise HTTPException(403, "Usuario bloqueado")
         new_state = 0 if u["active"] else 1
         con.execute("UPDATE users SET active=? WHERE id=?", (new_state, x_user_id))
         con.commit()
@@ -397,9 +413,11 @@ def toggle_auto(x_user_id: str = Header(None)):
     if not x_user_id:
         raise HTTPException(401, "No user id")
     with db() as con:
-        u = con.execute("SELECT auto_mode FROM users WHERE id=?", (x_user_id,)).fetchone()
+        u = con.execute("SELECT auto_mode, is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
         if not u:
             raise HTTPException(404, "not configured")
+        if u["is_blocked"]:
+            raise HTTPException(403, "Usuario bloqueado")
         new_state = 0 if u["auto_mode"] else 1
         con.execute("UPDATE users SET auto_mode=? WHERE id=?", (new_state, x_user_id))
         con.commit()
@@ -410,8 +428,12 @@ def games(x_user_id: str = Header(None)):
     if not x_user_id:
         raise HTTPException(401, "No user id")
     with db() as con:
-        if not con.execute("SELECT id FROM users WHERE id=?", (x_user_id,)).fetchone():
+        u = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
+        if not u:
             raise HTTPException(404, "not configured")
+        if u["is_blocked"]:
+            raise HTTPException(403, "Usuario bloqueado")
+            
         sel = {r["matchup"]: dict(r) for r in con.execute(
             "SELECT * FROM selection WHERE user_id=?", (x_user_id,))}
     result = []
@@ -427,8 +449,12 @@ def set_selection(body: Sel, x_user_id: str = Header(None)):
     if not x_user_id:
         raise HTTPException(401, "No user id")
     with db() as con:
-        if not con.execute("SELECT id FROM users WHERE id=?", (x_user_id,)).fetchone():
+        u = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
+        if not u:
             raise HTTPException(404, "not configured")
+        if u["is_blocked"]:
+            raise HTTPException(403, "Usuario bloqueado")
+            
         con.execute("UPDATE selection SET active=0 WHERE user_id=?", (x_user_id,))
         for m in body.matchups:
             row = con.execute(
@@ -450,15 +476,56 @@ def signals(x_user_id: str = Header(None)):
     if not x_user_id:
         raise HTTPException(401, "No user id")
     with db() as con:
+        u = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
+        if u and u["is_blocked"]:
+            raise HTTPException(403, "Usuario bloqueado")
+            
         rows = [dict(r) for r in con.execute(
             "SELECT * FROM signals WHERE user_id=? ORDER BY id DESC LIMIT 50",
             (x_user_id,))]
     return rows
 
+# =========================
+# RUTAS DE ADMINISTRADOR
+# =========================
+@app.get("/api/admin/users")
+def admin_users(passwd: str = Query(None)):
+    if passwd != ADMIN_PASS:
+        raise HTTPException(401, "Contraseña incorrecta")
+    with db() as con:
+        users = [dict(r) for r in con.execute("SELECT * FROM users ORDER BY created_at DESC")]
+    # Ocultar claves completas por seguridad
+    for u in users:
+        u["odds_key"] = (u["odds_key"][:4] + "..." + u["odds_key"][-4:]) if len(u["odds_key"]) > 8 else "***"
+        u["tg_token"] = (u["tg_token"][:4] + "..." + u["tg_token"][-4:]) if u["tg_token"] and len(u["tg_token"]) > 8 else "***"
+    return users
+
+@app.post("/api/admin/block/{user_id}")
+def admin_block(user_id: str, passwd: str = Query(None)):
+    if passwd != ADMIN_PASS:
+        raise HTTPException(401, "Contraseña incorrecta")
+    with db() as con:
+        u = con.execute("SELECT is_blocked FROM users WHERE id=?", (user_id,)).fetchone()
+        if not u:
+            raise HTTPException(404, "Usuario no encontrado")
+        new_state = 0 if u["is_blocked"] else 1
+        con.execute("UPDATE users SET is_blocked=? WHERE id=?", (new_state, user_id))
+        con.commit()
+    return {"blocked": bool(new_state)}
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(passwd: str = Query(None)):
+    if passwd != ADMIN_PASS:
+        return HTMLResponse("<h1>401 - Acceso Denegado</h1><p>Añade ?passwd=tu_clave a la URL.</p>", status_code=401)
+    return ADMIN_HTML
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML_PAGE
 
+# =========================
+# HTML FRONTEND
+# =========================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
@@ -570,9 +637,14 @@ function escapeAttr(s){
 async function loadUser() {
   try {
     const r = await api('/api/user');
-    if (r.status === 404) {
+    if (r.status === 404 || r.status === 403) {
       document.getElementById('settings').classList.remove('hidden');
       document.getElementById('main').classList.add('hidden');
+      if (r.status === 403) {
+          const msg = document.getElementById('settingsMsg');
+          msg.className = 'msg err';
+          msg.textContent = 'Tu cuenta ha sido bloqueada por el administrador.';
+      }
       return false;
     }
     if (r.status === 200) {
@@ -638,7 +710,7 @@ async function saveUser() {
     loadGames();
   } else {
     msg.className = 'msg err';
-    msg.textContent = 'Error guardando';
+    msg.textContent = 'Error guardando (¿Estás bloqueado?)';
   }
 }
 
@@ -800,6 +872,101 @@ async function init() {
 }
 
 init();
+</script>
+</body></html>
+"""
+
+ADMIN_HTML = r"""<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin - NBA Signals</title>
+<style>
+  :root{--bg:#0f172a;--card:#1e293b;--txt:#e2e8f0;--muted:#94a3b8;--red:#ef4444;--green:#22c55e;}
+  body{font-family:-apple-system,system-ui;margin:0;padding:16px;background:var(--bg);color:var(--txt);}
+  h1{font-size:22px;margin-bottom:16px;}
+  table{width:100%;border-collapse:collapse;margin-top:16px;background:var(--card);border-radius:8px;overflow:hidden;}
+  th,td{padding:12px;text-align:left;border-bottom:1px solid #334155;font-size:14px;}
+  th{background:#1e293b;color:var(--muted);font-weight:600;text-transform:uppercase;font-size:12px;}
+  tr:last-child td{border-bottom:none;}
+  .badge{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;}
+  .bg-green{background:#14532d;color:#86efac;}
+  .bg-red{background:#7f1d1d;color:#fca5a5;}
+  .bg-gray{background:#334155;color:#cbd5e1;}
+  button{padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-weight:bold;color:#fff;}
+  .btn-block{background:var(--red);}
+  .btn-unblock{background:var(--green);}
+</style>
+</head><body>
+<h1>🕵️‍♂️ Panel de Administrador</h1>
+<p class="hint">Lista de usuarios registrados en el bot.</p>
+
+<table id="usersTable">
+  <thead>
+    <tr>
+      <th>ID Usuario</th>
+      <th>Fecha Registro</th>
+      <th>Estado</th>
+      <th>Odds API</th>
+      <th>Acciones</th>
+    </tr>
+  </thead>
+  <tbody id="usersBody">
+    <tr><td colspan="5" style="text-align:center;">Cargando...</td></tr>
+  </tbody>
+</table>
+
+<script>
+const urlParams = new URLSearchParams(window.location.search);
+const passwd = urlParams.get('passwd');
+
+async function loadUsers() {
+  const res = await fetch(`/api/admin/users?passwd=${passwd}`);
+  if (!res.ok) {
+    document.getElementById('usersBody').innerHTML = '<tr><td colspan="5" style="color:red;">Error de autenticación. Revisa tu contraseña.</td></tr>';
+    return;
+  }
+  const users = await res.json();
+  const tbody = document.getElementById('usersBody');
+  
+  if (users.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">No hay usuarios registrados.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = users.map(u => {
+    const status = u.is_blocked ? '<span class="badge bg-red">BLOQUEADO</span>' : '<span class="badge bg-green">ACTIVO</span>';
+    const botState = u.active ? '🟢' : '⚪';
+    const autoState = u.auto_mode ? '🎯' : '';
+    const date = new Date(u.created_at).toLocaleString();
+    
+    return `<tr>
+      <td><code>${u.id}</code></td>
+      <td>${date}</td>
+      <td>${status} ${botState} ${autoState}</td>
+      <td>${u.odds_key}</td>
+      <td>
+        <button class="${u.is_blocked ? 'btn-unblock' : 'btn-block'}" onclick="toggleBlock('${u.id}', ${u.is_blocked})">
+          ${u.is_blocked ? 'Desbloquear' : 'Bloquear'}
+        </button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function toggleBlock(userId, isCurrentlyBlocked) {
+  const action = isCurrentlyBlocked ? 'desbloquear' : 'bloquear';
+  if (!confirm(`¿Estás seguro de que quieres ${action} a este usuario?`)) return;
+
+  const res = await fetch(`/api/admin/block/${userId}?passwd=${passwd}`, { method: 'POST' });
+  if (res.ok) {
+    loadUsers();
+  } else {
+    alert('Error al cambiar el estado del usuario.');
+  }
+}
+
+loadUsers();
 </script>
 </body></html>
 """
