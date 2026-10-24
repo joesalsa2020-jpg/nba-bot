@@ -14,7 +14,7 @@ POLL_INTERVAL = 120  # 2 minutos para ahorrar InferSports
 MIN_DIFF = 7.0
 DB = "nba.db"
 ADMIN_PASS = "admin123"  # 👈 CAMBIA ESTO
-THEODDS_API_KEY = "8685233a768b4d44ad813dcb2abc20f4" # 👈 Tu clave de respaldo
+THEODDS_API_KEY = "2cc2dfc1b911c94ebd39d2909668831c" # 👈 Tu clave de respaldo
 
 def db():
     con = sqlite3.connect(DB, check_same_thread=False)
