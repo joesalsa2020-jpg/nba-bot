@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3/Q4 + Panel Admin + Estadísticas + Anti-Cruce + InferSports API)
+Bot NBA - Multi-usuario (Una señal por partido: HT, Q3 o Q4 + InferSports API)
 """
 import os, sqlite3, requests
 from datetime import datetime, timezone
@@ -82,7 +82,6 @@ def espn_games():
         return []
 
 def odds_totals_infer():
-    """Obtiene cuotas en vivo desde InferSports y las empareja con los nombres de ESPN"""
     try:
         r = requests.get("https://api.infersports.dev/v1/events/live", timeout=15)
         if r.status_code != 200:
@@ -94,8 +93,6 @@ def odds_totals_infer():
         odds_dict = {}
         for ev in eventos_infer:
             event_id = ev["id"]
-            # InferSports usa nombres cortos (Ej: N.Y.Knicks) y ESPN usa largos (New York Knicks)
-            # Extraemos la parte importante después del punto: "Knicks"
             home_short = ev["home_team"]["name"].split(".")[-1].strip()
             away_short = ev["away_team"]["name"].split(".")[-1].strip()
             
@@ -128,7 +125,6 @@ def odds_totals_infer():
                 now = datetime.now(timezone.utc)
                 age_min = (now - mejor_time).total_seconds() / 60.0
                 
-                # Guardamos usando un formato que podamos buscar luego
                 odds_dict[f"{away_short} vs {home_short}"] = {
                     "line": float(mejor_linea),
                     "over": float(mejor_cuota_over),
@@ -240,15 +236,12 @@ def poll():
         if not games:
             return
 
-        # OBTENER CUOTAS DE INFERSPORTS UNA VEZ POR CICLO
         infer_odds = odds_totals_infer()
         
-        # EMPAREJAR NOMBRES (ESPN largo vs InferSports corto)
         matched_odds = {}
         for real_match in games.keys():
             for short_match, ln in infer_odds.items():
                 away_short, home_short = short_match.split(" vs ")
-                # Si "Knicks" está en "N.Y.Knicks vs Bo.Celtics" y "Celtics" también
                 if away_short in real_match and home_short in real_match:
                     matched_odds[real_match] = ln
                     break
@@ -272,12 +265,11 @@ def poll():
                         if not ln:
                             continue
                         
-                        current_phase = 2 if "Half" in g["status"] else g["period"]
-                        
+                        # REGLA DE ORO: Si ya hay una señal de este partido, se ignora.
                         with db() as con:
                             already_sent = con.execute(
-                                "SELECT id FROM signals WHERE user_id=? AND matchup=? AND period=?", 
-                                (u["id"], matchup, current_phase)
+                                "SELECT id FROM signals WHERE user_id=? AND matchup=?", 
+                                (u["id"], matchup)
                             ).fetchone()
                         if already_sent:
                             continue
@@ -291,17 +283,6 @@ def poll():
                             continue
 
                         decision = "OVER" if diff > 0 else "UNDER"
-                        
-                        with db() as con:
-                            prev_sig = con.execute(
-                                "SELECT decision FROM signals WHERE user_id=? AND matchup=? ORDER BY id DESC LIMIT 1", 
-                                (u["id"], matchup)
-                            ).fetchone()
-                            
-                        if prev_sig and prev_sig["decision"] != decision:
-                            print(f"[SKIP CRUCE] {matchup}: Ya se envió {prev_sig['decision']}, ahora daba {decision}. Ignorado.")
-                            continue
-
                         cuota = ln["over"] if decision == "OVER" else ln["under"]
                         conf = min(99, max(10, int((abs(diff) / 20) * 100 * (mins / 48))))
                         msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=True)
@@ -336,6 +317,19 @@ def poll():
                         ln = matched_odds.get(matchup)
                         if not ln:
                             continue
+                            
+                        # REGLA DE ORO: Si ya hay una señal de este partido, se ignora.
+                        with db() as con:
+                            already_sent = con.execute(
+                                "SELECT id FROM signals WHERE user_id=? AND matchup=?", 
+                                (u["id"], matchup)
+                            ).fetchone()
+                        if already_sent:
+                            with db() as con:
+                                con.execute("UPDATE selection SET sent=1 WHERE user_id=? AND matchup=?", (u["id"], matchup))
+                                con.commit()
+                            continue
+                            
                         mins = minutes_played(g["period"], g["clock"], g["status"])
                         proj = project_total(g["total"], mins, g["period"])
                         if proj is None:
