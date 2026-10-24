@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (Versión Final Definitiva Corregida)
+Bot NBA - Multi-usuario (InferSports + Respaldo TheOddsAPI)
 """
 import os, sqlite3, requests
 from datetime import datetime, timezone
@@ -10,10 +10,11 @@ from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
 
-POLL_INTERVAL = 30
+POLL_INTERVAL = 120  # 2 minutos para ahorrar InferSports
 MIN_DIFF = 7.0
 DB = "nba.db"
-ADMIN_PASS = "admin123"  # 👈 CAMBIA ESTO POR TU CONTRASEÑA SECRETA
+ADMIN_PASS = "admin123"  # 👈 CAMBIA ESTO
+THEODDS_API_KEY = "8685233a768b4d44ad813dcb2abc20f4" # 👈 Tu clave de respaldo
 
 def db():
     con = sqlite3.connect(DB, check_same_thread=False)
@@ -79,7 +80,6 @@ def espn_games():
 
 def odds_totals_infer():
     try:
-        # DISFRAZ DE NAVEGADOR CHROME PARA EVITAR BLOQUEOS EN RENDER
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'application/json'
@@ -91,10 +91,6 @@ def odds_totals_infer():
             return {}
         
         data = r.json()
-        if not data.get("data"):
-            print("[odds infer] La API respondió 200, pero devolvió una lista vacía.")
-            return {}
-            
         eventos_infer = [ev for ev in data.get("data", []) if ev.get("sport") == "basketball" and ev.get("league", {}).get("name") == "NBA"]
         
         odds_dict = {}
@@ -140,6 +136,45 @@ def odds_totals_infer():
         print(f"[odds infer error] {e}")
         return {}
 
+def odds_totals_theoddsapi(api_key):
+    """Plan B: Obtiene cuotas de TheOddsAPI si InferSports falla"""
+    try:
+        r = requests.get(
+            "https://api.the-odds-api.com/v4/sports/basketball_nba/odds/",
+            params={"apiKey": api_key, "regions": "us",
+                    "markets": "totals", "oddsFormat": "decimal"},
+            timeout=15)
+        if r.status_code != 200:
+            print(f"[TheOddsAPI error] {r.status_code}")
+            return {}
+        out = {}
+        for m in r.json():
+            matchup = f"{m['away_team']} vs {m['home_team']}"
+            # Buscar la casa de apuestas (prioridad Pinnacle, sino la primera)
+            bm = next((b for b in m.get("bookmakers", []) if b.get("key") == "pinnacle"), None) \
+                 or (m.get("bookmakers") or [None])[0]
+            if not bm: continue
+            mk = next((x for x in bm.get("markets", []) if x.get("key") == "totals"), None)
+            if not mk: continue
+            line = over = under = None
+            for o in mk.get("outcomes", []):
+                if "point" in o and "price" in o:
+                    line = float(o["point"])
+                    if o.get("name", "").lower() == "over":
+                        over = float(o["price"])
+                    elif o.get("name", "").lower() == "under":
+                        under = float(o["price"])
+            if line is not None:
+                out[matchup] = {
+                    "line": line, "over": over, "under": under,
+                    "bookmaker": bm.get("title", "TheOddsAPI"),
+                    "age_min": 0.0
+                }
+        return out
+    except Exception as e:
+        print(f"[TheOddsAPI error] {e}")
+        return {}
+
 def minutes_played(period, clock, status=""):
     if period == 0: return 0.0
     completed = max(0, period - 1)
@@ -157,14 +192,10 @@ def minutes_played(period, clock, status=""):
                 ml = int(mm) + int(ss) / 60.0
             else:
                 ml = float(clock)
-                # ARREGLO DEL BUG: Si ESPN manda 49.0 (segundos) en vez de 0:49
-                if ml > 12.0:
-                    ml = ml / 60.0
-                    
+                if ml > 12.0: ml = ml / 60.0
             plen = 12.0 if period <= 4 else 5.0
             mins += max(0.0, plen - ml)
-        except Exception:
-            pass
+        except Exception: pass
     return mins
 
 def project_total(total, minutes, period):
@@ -227,7 +258,6 @@ def check_results():
 
 def poll():
     try:
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] --- INICIANDO REVISIÓN ---")
         with db() as con:
             users = con.execute("SELECT * FROM users WHERE (active = 1 OR auto_mode = 1) AND is_blocked = 0").fetchall()
         if not users: return
@@ -235,11 +265,26 @@ def poll():
         games = {g["matchup"]: g for g in espn_games()}
         if not games: return
 
-        infer_odds = odds_totals_infer()
-        print(f"[POLL] ESPN: {len(games)} partidos | InferSports: {len(infer_odds)} con cuotas.")
+        # PASO 1: Verificar si hay partidos válidos (HT, Q3, Q4)
+        partidos_validos = []
+        for g in games.values():
+            is_ht = "Half" in g["status"]
+            is_q3_q4_live = (g["period"] in (3, 4) and g["state"] == "in")
+            if is_ht or is_q3_q4_live:
+                partidos_validos.append(g)
+                
+        if not partidos_validos:
+            return # No hay partidos válidos, no gastamos APIs
+
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] --- INICIANDO REVISIÓN ({len(partidos_validos)} partidos válidos) ---")
         
+        # PASO 2: Intentar obtener cuotas de InferSports
+        infer_odds = odds_totals_infer()
+        
+        # PASO 3: Emparejar cuotas de InferSports
         matched_odds = {}
-        for real_match in games.keys():
+        for g in partidos_validos:
+            real_match = g["matchup"]
             for short_match, ln in infer_odds.items():
                 away_short = short_match.split(" vs ")[0].split()[-1].lower()
                 home_short = short_match.split(" vs ")[1].split()[-1].lower()
@@ -247,25 +292,35 @@ def poll():
                 if away_short in real_lower and home_short in real_lower:
                     matched_odds[real_match] = ln
                     break
+        
+        # PASO 4: Si hay partidos válidos sin cuota (Plan B: TheOddsAPI)
+        faltantes = [g for g in partidos_validos if g["matchup"] not in matched_odds]
+        if faltantes:
+            print(f"[PLAN B] InferSports falló o no tiene cuotas para {len(faltantes)} partidos. Usando TheOddsAPI...")
+            api_key = users[0]["odds_key"] if users[0]["odds_key"] else THEODDS_API_KEY
+            theodds_data = odds_totals_theoddsapi(api_key)
+            
+            for g in faltantes:
+                matchup = g["matchup"]
+                if matchup in theodds_data:
+                    matched_odds[matchup] = theodds_data[matchup]
+                    print(f"[PLAN B OK] Cuota de respaldo obtenida para {matchup}")
 
+        if not matched_odds:
+            print("[POLL] No se pudo obtener cuotas de ninguna fuente.")
+            return
+
+        print(f"[POLL] Cuotas totales obtenidas: {len(matched_odds)}")
+
+        # PASO 5: Procesar señales
         for u in users:
             try:
                 if u["auto_mode"]:
-                    target_games = []
-                    for g in games.values():
-                        is_ht = "Half" in g["status"]
-                        is_q3_q4_live = (g["period"] in (3, 4) and g["state"] == "in")
-                        if is_ht or is_q3_q4_live:
-                            target_games.append(g)
-                    
-                    if not target_games: continue
-                        
-                    for g in target_games:
+                    for g in partidos_validos:
                         matchup = g["matchup"]
                         ln = matched_odds.get(matchup)
                         if not ln: continue
                         
-                        # REGLA DE ORO: Si ya hay una señal de este partido, se ignora.
                         with db() as con:
                             already_sent = con.execute("SELECT id FROM signals WHERE user_id=? AND matchup=?", (u["id"], matchup)).fetchone()
                         if already_sent: continue
@@ -275,7 +330,7 @@ def poll():
                         if proj is None: continue
                         diff = proj - ln["line"]
                         
-                        print(f"[EVAL AUTO] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
+                        print(f"[EVAL AUTO] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} ({ln['bookmaker']}) | Diff: {diff:+.1f}")
                         if abs(diff) < MIN_DIFF: continue
 
                         decision = "OVER" if diff > 0 else "UNDER"
@@ -318,7 +373,7 @@ def poll():
                         if proj is None: continue
                         diff = proj - ln["line"]
                         
-                        print(f"[EVAL MANUAL] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
+                        print(f"[EVAL MANUAL] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} ({ln['bookmaker']}) | Diff: {diff:+.1f}")
                         if abs(diff) < MIN_DIFF: continue
 
                         decision = "OVER" if diff > 0 else "UNDER"
@@ -372,7 +427,7 @@ def test_user(body: UserCfg):
             r = requests.get(f"https://api.telegram.org/bot{body.tg_token}/getMe", timeout=10)
             if r.status_code != 200: errors.append("Telegram inválido")
         except: errors.append("Error de Telegram")
-    return {"ok": not errors, "errors": errors, "tg_user": "OK", "odds_remaining": "InferSports (Gratis)"}
+    return {"ok": not errors, "errors": errors, "tg_user": "OK", "odds_remaining": "InferSports + Respaldo"}
 
 @app.post("/api/user")
 def save_user(body: UserCfg, x_user_id: str = Header(None)):
