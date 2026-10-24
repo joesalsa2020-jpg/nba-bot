@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (InferSports + Respaldo TheOddsAPI)
+Bot NBA - Multi-usuario (InferSports PRO + Respaldo TheOddsAPI)
 """
 import os, sqlite3, requests
 from datetime import datetime, timezone
@@ -10,11 +10,16 @@ from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
 
-POLL_INTERVAL = 120  # 2 minutos para ahorrar InferSports
+POLL_INTERVAL = 120  # 2 minutos para ahorrar peticiones
 MIN_DIFF = 7.0
 DB = "nba.db"
-ADMIN_PASS = "admin123"  # 👈 CAMBIA ESTO
-THEODDS_API_KEY = "2cc2dfc1b911c94ebd39d2909668831c" # 👈 Tu clave de respaldo
+ADMIN_PASS = "admin123"  # 👈 CAMBIA ESTO POR TU CONTRASEÑA SECRETA
+
+# 🔑 AQUÍ VA TU CLAVE DE INFERSPORTS (La que copiaste en la web)
+INFER_API_KEY = "isk_sbSsZl0rFrEbscbN0NHb4_K_qEwfF5Kl" 
+
+# 🔑 AQUÍ VA TU CLAVE DE THEODDSAPI (El respaldo por si InferSports falla)
+THEODDS_API_KEY = "2cc2dfc1b911c94ebd39d2909668831c"
 
 def db():
     con = sqlite3.connect(DB, check_same_thread=False)
@@ -82,7 +87,8 @@ def odds_totals_infer():
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json'
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {INFER_API_KEY}'  # <--- Autenticación con tu clave PRO
         }
         r = requests.get("https://api.infersports.dev/v1/events/live", headers=headers, timeout=15)
         
@@ -278,7 +284,7 @@ def poll():
 
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] --- INICIANDO REVISIÓN ({len(partidos_validos)} partidos válidos) ---")
         
-        # PASO 2: Intentar obtener cuotas de InferSports
+        # PASO 2: Intentar obtener cuotas de InferSports (Primera opción)
         infer_odds = odds_totals_infer()
         
         # PASO 3: Emparejar cuotas de InferSports
@@ -293,10 +299,11 @@ def poll():
                     matched_odds[real_match] = ln
                     break
         
-        # PASO 4: Si hay partidos válidos sin cuota (Plan B: TheOddsAPI)
+        # PASO 4: Si hay partidos válidos sin cuota, usar TheOddsAPI (Plan B)
         faltantes = [g for g in partidos_validos if g["matchup"] not in matched_odds]
         if faltantes:
             print(f"[PLAN B] InferSports falló o no tiene cuotas para {len(faltantes)} partidos. Usando TheOddsAPI...")
+            # Usamos la clave del primer usuario o la global si no hay
             api_key = users[0]["odds_key"] if users[0]["odds_key"] else THEODDS_API_KEY
             theodds_data = odds_totals_theoddsapi(api_key)
             
@@ -427,7 +434,7 @@ def test_user(body: UserCfg):
             r = requests.get(f"https://api.telegram.org/bot{body.tg_token}/getMe", timeout=10)
             if r.status_code != 200: errors.append("Telegram inválido")
         except: errors.append("Error de Telegram")
-    return {"ok": not errors, "errors": errors, "tg_user": "OK", "odds_remaining": "InferSports + Respaldo"}
+    return {"ok": not errors, "errors": errors, "tg_user": "OK", "odds_remaining": "InferSports PRO + Respaldo"}
 
 @app.post("/api/user")
 def save_user(body: UserCfg, x_user_id: str = Header(None)):
