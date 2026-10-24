@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (Una señal por partido: HT, Q3 o Q4 + InferSports API)
+Bot NBA - Multi-usuario (Versión Final Definitiva Corregida)
 """
 import os, sqlite3, requests
 from datetime import datetime, timezone
@@ -53,15 +53,12 @@ def init_db():
 
 def espn_games():
     try:
-        r = requests.get(
-            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-            timeout=15)
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
         out = []
         for ev in r.json().get("events", []):
             comp = ev.get("competitions", [{}])[0]
             cs = comp.get("competitors", [])
-            if len(cs) < 2:
-                continue
+            if len(cs) < 2: continue
             home = next((c for c in cs if c.get("homeAway") == "home"), cs[0])
             away = next((c for c in cs if c.get("homeAway") == "away"), cs[1])
             ht = home.get("team", {}).get("displayName", "Home")
@@ -73,8 +70,7 @@ def espn_games():
                 "state": st.get("type", {}).get("state", ""),
                 "period": int(st.get("period", 0) or 0),
                 "clock": st.get("displayClock", "") or "",
-                "total": sum(int(q.get("value", 0))
-                             for q in (home.get("linescores", []) + away.get("linescores", []))),
+                "total": sum(int(q.get("value", 0)) for q in (home.get("linescores", []) + away.get("linescores", []))),
             })
         return out
     except Exception as e:
@@ -83,12 +79,23 @@ def espn_games():
 
 def odds_totals_infer():
     try:
-        r = requests.get("https://api.infersports.dev/v1/events/live", timeout=15)
+        # DISFRAZ DE NAVEGADOR CHROME PARA EVITAR BLOQUEOS EN RENDER
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json'
+        }
+        r = requests.get("https://api.infersports.dev/v1/events/live", headers=headers, timeout=15)
+        
         if r.status_code != 200:
+            print(f"[odds infer error] Status Code: {r.status_code} - {r.text[:100]}")
             return {}
         
-        eventos_infer = [ev for ev in r.json().get("data", []) 
-                         if ev.get("sport") == "basketball" and ev.get("league", {}).get("name") == "NBA"]
+        data = r.json()
+        if not data.get("data"):
+            print("[odds infer] La API respondió 200, pero devolvió una lista vacía.")
+            return {}
+            
+        eventos_infer = [ev for ev in data.get("data", []) if ev.get("sport") == "basketball" and ev.get("league", {}).get("name") == "NBA"]
         
         odds_dict = {}
         for ev in eventos_infer:
@@ -96,12 +103,10 @@ def odds_totals_infer():
             home_short = ev["home_team"]["name"].split(".")[-1].strip()
             away_short = ev["away_team"]["name"].split(".")[-1].strip()
             
-            r_odds = requests.get(f"https://api.infersports.dev/v1/events/{event_id}/odds?format=decimal", timeout=15)
-            if r_odds.status_code != 200:
-                continue
+            r_odds = requests.get(f"https://api.infersports.dev/v1/events/{event_id}/odds?format=decimal", headers=headers, timeout=15)
+            if r_odds.status_code != 200: continue
                 
             odds_data = r_odds.json()
-            
             mejor_linea = None
             mejor_cuota_over = None
             mejor_cuota_under = None
@@ -112,8 +117,7 @@ def odds_totals_infer():
                     as_of_str = odd.get("as_of")
                     try:
                         as_of_time = datetime.fromisoformat(as_of_str.replace('Z', '+00:00'))
-                    except:
-                        continue
+                    except: continue
                         
                     if mejor_time is None or as_of_time > mejor_time:
                         mejor_time = as_of_time
@@ -124,7 +128,6 @@ def odds_totals_infer():
             if mejor_linea is not None:
                 now = datetime.now(timezone.utc)
                 age_min = (now - mejor_time).total_seconds() / 60.0
-                
                 odds_dict[f"{away_short} vs {home_short}"] = {
                     "line": float(mejor_linea),
                     "over": float(mejor_cuota_over),
@@ -138,8 +141,7 @@ def odds_totals_infer():
         return {}
 
 def minutes_played(period, clock, status=""):
-    if period == 0:
-        return 0.0
+    if period == 0: return 0.0
     completed = max(0, period - 1)
     reg, ot = min(4, completed), max(0, completed - 4)
     mins = reg * 12 + ot * 5
@@ -155,6 +157,10 @@ def minutes_played(period, clock, status=""):
                 ml = int(mm) + int(ss) / 60.0
             else:
                 ml = float(clock)
+                # ARREGLO DEL BUG: Si ESPN manda 49.0 (segundos) en vez de 0:49
+                if ml > 12.0:
+                    ml = ml / 60.0
+                    
             plen = 12.0 if period <= 4 else 5.0
             mins += max(0.0, plen - ml)
         except Exception:
@@ -162,20 +168,15 @@ def minutes_played(period, clock, status=""):
     return mins
 
 def project_total(total, minutes, period):
-    if minutes <= 0.1:
-        return None
+    if minutes <= 0.1: return None
     total_min = 48.0 if period <= 4 else 48.0 + (period - 4) * 5.0
     return (total / minutes) * total_min
 
 def send_tg(token, chat_id, msg):
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
-            timeout=15)
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}, timeout=15)
         return r.status_code == 200
-    except Exception:
-        return False
+    except: return False
 
 def format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False):
     arrow = "⬆️ OVER" if decision == "OVER" else "⬇️ UNDER"
@@ -202,8 +203,7 @@ def check_results():
     try:
         with db() as con:
             pending = con.execute("SELECT * FROM signals WHERE status='PENDING'").fetchall()
-        if not pending:
-            return
+        if not pending: return
         games = {g["matchup"]: g for g in espn_games()}
         for sig in pending:
             g = games.get(sig["matchup"])
@@ -230,25 +230,20 @@ def poll():
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] --- INICIANDO REVISIÓN ---")
         with db() as con:
             users = con.execute("SELECT * FROM users WHERE (active = 1 OR auto_mode = 1) AND is_blocked = 0").fetchall()
-        if not users:
-            return
+        if not users: return
 
         games = {g["matchup"]: g for g in espn_games()}
-        if not games:
-            return
+        if not games: return
 
         infer_odds = odds_totals_infer()
-        print(f"[POLL] ESPN: {len(games)} partidos | InferSports: {len(infer_odds)} partidos con cuotas.")
+        print(f"[POLL] ESPN: {len(games)} partidos | InferSports: {len(infer_odds)} con cuotas.")
         
         matched_odds = {}
         for real_match in games.keys():
             for short_match, ln in infer_odds.items():
-                # EL TRADUCTOR DEFINITIVO (Última palabra del equipo)
                 away_short = short_match.split(" vs ")[0].split()[-1].lower()
                 home_short = short_match.split(" vs ")[1].split()[-1].lower()
-                
                 real_lower = real_match.lower()
-                
                 if away_short in real_lower and home_short in real_lower:
                     matched_odds[real_match] = ln
                     break
@@ -263,33 +258,25 @@ def poll():
                         if is_ht or is_q3_q4_live:
                             target_games.append(g)
                     
-                    if not target_games:
-                        continue
+                    if not target_games: continue
                         
                     for g in target_games:
                         matchup = g["matchup"]
                         ln = matched_odds.get(matchup)
-                        if not ln:
-                            continue
+                        if not ln: continue
                         
                         # REGLA DE ORO: Si ya hay una señal de este partido, se ignora.
                         with db() as con:
-                            already_sent = con.execute(
-                                "SELECT id FROM signals WHERE user_id=? AND matchup=?", 
-                                (u["id"], matchup)
-                            ).fetchone()
-                        if already_sent:
-                            continue
+                            already_sent = con.execute("SELECT id FROM signals WHERE user_id=? AND matchup=?", (u["id"], matchup)).fetchone()
+                        if already_sent: continue
                             
                         mins = minutes_played(g["period"], g["clock"], g["status"])
                         proj = project_total(g["total"], mins, g["period"])
-                        if proj is None:
-                            continue
+                        if proj is None: continue
                         diff = proj - ln["line"]
-                        print(f"[EVAL] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
                         
-                        if abs(diff) < MIN_DIFF:
-                            continue
+                        print(f"[EVAL AUTO] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
+                        if abs(diff) < MIN_DIFF: continue
 
                         decision = "OVER" if diff > 0 else "UNDER"
                         cuota = ln["over"] if decision == "OVER" else ln["under"]
@@ -297,13 +284,8 @@ def poll():
                         msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=True)
 
                         with db() as con:
-                            con.execute(
-                                "INSERT INTO signals(user_id,matchup,decision,line,cuota,"
-                                "proyeccion,diff,confianza,total,period,created_at) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                                (u["id"], matchup, decision, ln["line"], cuota,
-                                 proj, diff, conf, g["total"], g["period"],
-                                 datetime.now().isoformat()))
+                            con.execute("INSERT INTO signals(user_id,matchup,decision,line,cuota,proyeccion,diff,confianza,total,period,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (u["id"], matchup, decision, ln["line"], cuota, proj, diff, conf, g["total"], g["period"], datetime.now().isoformat()))
                             con.commit()
                         
                         if u["tg_token"] and u["tg_chat_id"]:
@@ -313,26 +295,18 @@ def poll():
                             print(f"[AUTO SIGNAL] {u['id'][:8]} {matchup} {decision} {ln['line']:.1f} (Web)")
                 else:
                     with db() as con:
-                        sel = [r["matchup"] for r in con.execute(
-                            "SELECT matchup FROM selection "
-                            "WHERE user_id=? AND active=1 AND sent=0", (u["id"],))]
+                        sel = [r["matchup"] for r in con.execute("SELECT matchup FROM selection WHERE user_id=? AND active=1 AND sent=0", (u["id"],))]
                     
                     live = [m for m in sel if m in games and games[m]["state"] == "in" and "Half" not in games[m]["status"] and "End" not in games[m]["status"]]
-                    if not live:
-                        continue
+                    if not live: continue
 
                     for matchup in live:
                         g = games[matchup]
                         ln = matched_odds.get(matchup)
-                        if not ln:
-                            continue
+                        if not ln: continue
                             
-                        # REGLA DE ORO: Si ya hay una señal de este partido, se ignora.
                         with db() as con:
-                            already_sent = con.execute(
-                                "SELECT id FROM signals WHERE user_id=? AND matchup=?", 
-                                (u["id"], matchup)
-                            ).fetchone()
+                            already_sent = con.execute("SELECT id FROM signals WHERE user_id=? AND matchup=?", (u["id"], matchup)).fetchone()
                         if already_sent:
                             with db() as con:
                                 con.execute("UPDATE selection SET sent=1 WHERE user_id=? AND matchup=?", (u["id"], matchup))
@@ -341,13 +315,11 @@ def poll():
                             
                         mins = minutes_played(g["period"], g["clock"], g["status"])
                         proj = project_total(g["total"], mins, g["period"])
-                        if proj is None:
-                            continue
+                        if proj is None: continue
                         diff = proj - ln["line"]
-                        print(f"[EVAL MANUAL] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
                         
-                        if abs(diff) < MIN_DIFF:
-                            continue
+                        print(f"[EVAL MANUAL] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
+                        if abs(diff) < MIN_DIFF: continue
 
                         decision = "OVER" if diff > 0 else "UNDER"
                         cuota = ln["over"] if decision == "OVER" else ln["under"]
@@ -355,23 +327,14 @@ def poll():
                         msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False)
 
                         with db() as con:
-                            con.execute(
-                                "INSERT INTO signals(user_id,matchup,decision,line,cuota,"
-                                "proyeccion,diff,confianza,total,period,created_at) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                                (u["id"], matchup, decision, ln["line"], cuota,
-                                 proj, diff, conf, g["total"], g["period"],
-                                 datetime.now().isoformat()))
-                            con.execute(
-                                "UPDATE selection SET sent=1 "
-                                "WHERE user_id=? AND matchup=?", (u["id"], matchup))
+                            con.execute("INSERT INTO signals(user_id,matchup,decision,line,cuota,proyeccion,diff,confianza,total,period,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (u["id"], matchup, decision, ln["line"], cuota, proj, diff, conf, g["total"], g["period"], datetime.now().isoformat()))
+                            con.execute("UPDATE selection SET sent=1 WHERE user_id=? AND matchup=?", (u["id"], matchup))
                             con.commit()
                         
                         if u["tg_token"] and u["tg_chat_id"]:
                             if send_tg(u["tg_token"], u["tg_chat_id"], msg):
                                 print(f"[SIGNAL + TG] {u['id'][:8]} {matchup} {decision} {ln['line']:.1f}")
-                            else:
-                                print(f"[SIGNAL] {u['id'][:8]} {matchup} (Fallo envio TG)")
                         else:
                             print(f"[SIGNAL] {u['id'][:8]} {matchup} (Guardada solo en Web)")
             except Exception as e:
@@ -413,47 +376,31 @@ def test_user(body: UserCfg):
 
 @app.post("/api/user")
 def save_user(body: UserCfg, x_user_id: str = Header(None)):
-    if not x_user_id:
-        raise HTTPException(401, "No user id")
+    if not x_user_id: raise HTTPException(401, "No user id")
     with db() as con:
         existing = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
-        if existing and existing["is_blocked"]:
-            raise HTTPException(403, "Usuario bloqueado por el administrador")
-        con.execute(
-            "INSERT INTO users(id, odds_key, tg_token, tg_chat_id, created_at) "
-            "VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-            "tg_token=excluded.tg_token, tg_chat_id=excluded.tg_chat_id",
-            (x_user_id, body.odds_key, body.tg_token, body.tg_chat_id,
-             datetime.now().isoformat()))
+        if existing and existing["is_blocked"]: raise HTTPException(403, "Bloqueado")
+        con.execute("INSERT INTO users(id, odds_key, tg_token, tg_chat_id, created_at) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET tg_token=excluded.tg_token, tg_chat_id=excluded.tg_chat_id",
+            (x_user_id, body.odds_key, body.tg_token, body.tg_chat_id, datetime.now().isoformat()))
         con.commit()
     return {"ok": True}
 
 @app.get("/api/user")
 def get_user(x_user_id: str = Header(None)):
-    if not x_user_id:
-        raise HTTPException(401, "No user id")
+    if not x_user_id: raise HTTPException(401, "No user id")
     with db() as con:
         u = con.execute("SELECT * FROM users WHERE id=?", (x_user_id,)).fetchone()
-    if not u:
-        raise HTTPException(404, "not configured")
-    if u["is_blocked"]:
-        raise HTTPException(403, "Usuario bloqueado")
-    def mask(s):
-        return (s[:4] + "..." + s[-4:]) if s and len(s) >= 10 else "***"
-    return {"configured": True, "odds_key": mask(u["odds_key"]),
-            "tg_token": mask(u["tg_token"]), "tg_chat_id": u["tg_chat_id"],
-            "active": bool(u["active"]), "auto_mode": bool(u["auto_mode"])}
+    if not u: raise HTTPException(404, "not configured")
+    if u["is_blocked"]: raise HTTPException(403, "Bloqueado")
+    def mask(s): return (s[:4] + "..." + s[-4:]) if s and len(s) >= 10 else "***"
+    return {"configured": True, "odds_key": mask(u["odds_key"]), "tg_token": mask(u["tg_token"]), "tg_chat_id": u["tg_chat_id"], "active": bool(u["active"]), "auto_mode": bool(u["auto_mode"])}
 
 @app.post("/api/user/toggle")
 def toggle_user(x_user_id: str = Header(None)):
-    if not x_user_id:
-        raise HTTPException(401, "No user id")
+    if not x_user_id: raise HTTPException(401, "No user id")
     with db() as con:
         u = con.execute("SELECT active, is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
-        if not u:
-            raise HTTPException(404, "not configured")
-        if u["is_blocked"]:
-            raise HTTPException(403, "Usuario bloqueado")
+        if not u or u["is_blocked"]: raise HTTPException(403, "Error")
         new_state = 0 if u["active"] else 1
         con.execute("UPDATE users SET active=? WHERE id=?", (new_state, x_user_id))
         con.commit()
@@ -461,14 +408,10 @@ def toggle_user(x_user_id: str = Header(None)):
 
 @app.post("/api/user/toggle_auto")
 def toggle_auto(x_user_id: str = Header(None)):
-    if not x_user_id:
-        raise HTTPException(401, "No user id")
+    if not x_user_id: raise HTTPException(401, "No user id")
     with db() as con:
         u = con.execute("SELECT auto_mode, is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
-        if not u:
-            raise HTTPException(404, "not configured")
-        if u["is_blocked"]:
-            raise HTTPException(403, "Usuario bloqueado")
+        if not u or u["is_blocked"]: raise HTTPException(403, "Error")
         new_state = 0 if u["auto_mode"] else 1
         con.execute("UPDATE users SET auto_mode=? WHERE id=?", (new_state, x_user_id))
         con.commit()
@@ -476,16 +419,11 @@ def toggle_auto(x_user_id: str = Header(None)):
 
 @app.get("/api/games")
 def games(x_user_id: str = Header(None)):
-    if not x_user_id:
-        raise HTTPException(401, "No user id")
+    if not x_user_id: raise HTTPException(401, "No user id")
     with db() as con:
         u = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
-        if not u:
-            raise HTTPException(404, "not configured")
-        if u["is_blocked"]:
-            raise HTTPException(403, "Usuario bloqueado")
-        sel = {r["matchup"]: dict(r) for r in con.execute(
-            "SELECT * FROM selection WHERE user_id=?", (x_user_id,))}
+        if not u or u["is_blocked"]: raise HTTPException(403, "Error")
+        sel = {r["matchup"]: dict(r) for r in con.execute("SELECT * FROM selection WHERE user_id=?", (x_user_id,))}
     result = []
     for g in espn_games():
         s = sel.get(g["matchup"], {"active": 0, "sent": 0})
@@ -496,72 +434,41 @@ def games(x_user_id: str = Header(None)):
 
 @app.post("/api/selection")
 def set_selection(body: Sel, x_user_id: str = Header(None)):
-    if not x_user_id:
-        raise HTTPException(401, "No user id")
+    if not x_user_id: raise HTTPException(401, "No user id")
     with db() as con:
         u = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
-        if not u:
-            raise HTTPException(404, "not configured")
-        if u["is_blocked"]:
-            raise HTTPException(403, "Usuario bloqueado")
+        if not u or u["is_blocked"]: raise HTTPException(403, "Error")
         con.execute("UPDATE selection SET active=0 WHERE user_id=?", (x_user_id,))
         for m in body.matchups:
-            row = con.execute(
-                "SELECT matchup FROM selection WHERE user_id=? AND matchup=?",
-                (x_user_id, m)).fetchone()
-            if row:
-                con.execute(
-                    "UPDATE selection SET active=1, sent=0 "
-                    "WHERE user_id=? AND matchup=?", (x_user_id, m))
-            else:
-                con.execute(
-                    "INSERT INTO selection(user_id, matchup, active, sent) "
-                    "VALUES(?,?,1,0)", (x_user_id, m))
+            row = con.execute("SELECT matchup FROM selection WHERE user_id=? AND matchup=?", (x_user_id, m)).fetchone()
+            if row: con.execute("UPDATE selection SET active=1, sent=0 WHERE user_id=? AND matchup=?", (x_user_id, m))
+            else: con.execute("INSERT INTO selection(user_id, matchup, active, sent) VALUES(?,?,1,0)", (x_user_id, m))
         con.commit()
     return {"ok": True, "selected": body.matchups}
 
 @app.get("/api/signals")
 def signals(x_user_id: str = Header(None)):
-    if not x_user_id:
-        raise HTTPException(401, "No user id")
+    if not x_user_id: raise HTTPException(401, "No user id")
     with db() as con:
         u = con.execute("SELECT is_blocked FROM users WHERE id=?", (x_user_id,)).fetchone()
-        if u and u["is_blocked"]:
-            raise HTTPException(403, "Usuario bloqueado")
-        rows = [dict(r) for r in con.execute(
-            "SELECT * FROM signals WHERE user_id=? ORDER BY id DESC LIMIT 50",
-            (x_user_id,))]
+        if u and u["is_blocked"]: raise HTTPException(403, "Bloqueado")
+        rows = [dict(r) for r in con.execute("SELECT * FROM signals WHERE user_id=? ORDER BY id DESC LIMIT 50", (x_user_id,))]
     return rows
 
 @app.get("/api/stats")
 def get_stats(x_user_id: str = Header(None)):
-    if not x_user_id:
-        raise HTTPException(401, "No user id")
+    if not x_user_id: raise HTTPException(401, "No user id")
     with db() as con:
         res = con.execute("""
-            SELECT 
-                COUNT(*) as total,
-                SUM(CASE WHEN status='WON' THEN 1 ELSE 0 END) as won,
-                SUM(CASE WHEN status='LOST' THEN 1 ELSE 0 END) as lost,
-                SUM(CASE WHEN status='PUSH' THEN 1 ELSE 0 END) as push
-            FROM signals WHERE user_id=?
+            SELECT COUNT(*) as total, SUM(CASE WHEN status='WON' THEN 1 ELSE 0 END) as won, SUM(CASE WHEN status='LOST' THEN 1 ELSE 0 END) as lost, SUM(CASE WHEN status='PUSH' THEN 1 ELSE 0 END) as push FROM signals WHERE user_id=?
         """, (x_user_id,)).fetchone()
-    
     total_valid = (res["won"] or 0) + (res["lost"] or 0)
     win_rate = round(((res["won"] or 0) / total_valid * 100), 1) if total_valid > 0 else 0
-    
-    return {
-        "total": res["total"] or 0, 
-        "won": res["won"] or 0, 
-        "lost": res["lost"] or 0, 
-        "push": res["push"] or 0, 
-        "win_rate": win_rate
-    }
+    return {"total": res["total"] or 0, "won": res["won"] or 0, "lost": res["lost"] or 0, "push": res["push"] or 0, "win_rate": win_rate}
 
 @app.get("/api/admin/users")
 def admin_users(passwd: str = Query(None)):
-    if passwd != ADMIN_PASS:
-        raise HTTPException(401, "Contraseña incorrecta")
+    if passwd != ADMIN_PASS: raise HTTPException(401, "Contraseña incorrecta")
     with db() as con:
         users = [dict(r) for r in con.execute("SELECT * FROM users ORDER BY created_at DESC")]
     for u in users:
@@ -571,12 +478,10 @@ def admin_users(passwd: str = Query(None)):
 
 @app.post("/api/admin/block/{user_id}")
 def admin_block(user_id: str, passwd: str = Query(None)):
-    if passwd != ADMIN_PASS:
-        raise HTTPException(401, "Contraseña incorrecta")
+    if passwd != ADMIN_PASS: raise HTTPException(401, "Contraseña incorrecta")
     with db() as con:
         u = con.execute("SELECT is_blocked FROM users WHERE id=?", (user_id,)).fetchone()
-        if not u:
-            raise HTTPException(404, "Usuario no encontrado")
+        if not u: raise HTTPException(404, "No encontrado")
         new_state = 0 if u["is_blocked"] else 1
         con.execute("UPDATE users SET is_blocked=? WHERE id=?", (new_state, user_id))
         con.commit()
@@ -584,8 +489,7 @@ def admin_block(user_id: str, passwd: str = Query(None)):
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(passwd: str = Query(None)):
-    if passwd != ADMIN_PASS:
-        return HTMLResponse("<h1>401 - Acceso Denegado</h1><p>Añade ?passwd=tu_clave a la URL.</p>", status_code=401)
+    if passwd != ADMIN_PASS: return HTMLResponse("<h1>401 - Acceso Denegado</h1>", status_code=401)
     return ADMIN_HTML
 
 @app.get("/", response_class=HTMLResponse)
@@ -681,8 +585,7 @@ function getOrCreateUserId() {
   }
   let id = localStorage.getItem('nba_user_id');
   if (!id) {
-    id = (crypto.randomUUID ? crypto.randomUUID() : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c =>
-      (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16))).replace(/-/g,'');
+    id = (crypto.randomUUID ? crypto.randomUUID() : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16))).replace(/-/g,'');
     localStorage.setItem('nba_user_id', id);
   }
   return id;
@@ -814,10 +717,7 @@ async function toggleVigilancia() {
       btn.style.background = '#ef4444';
       btn.innerHTML = '🔴 VIGILANCIA APAGADA (Haz clic para encender)';
     }
-  } catch (e) {
-    console.error(e);
-    btn.innerHTML = 'Error al cambiar';
-  }
+  } catch (e) { console.error(e); }
   btn.disabled = false;
 }
 
@@ -835,10 +735,7 @@ async function toggleAuto() {
       btn.style.background = '#475569';
       btn.innerHTML = '🎯 PILOTO AUTOMÁTICO APAGADO (HT, Q3 y Q4)';
     }
-  } catch (e) {
-    console.error(e);
-    btn.innerHTML = 'Error al cambiar';
-  }
+  } catch (e) { console.error(e); }
   btn.disabled = false;
 }
 
@@ -848,9 +745,7 @@ async function loadStats() {
     if (!r.ok) return;
     const d = await r.json();
     const div = document.getElementById('stats');
-    
     const color = d.win_rate >= 50 ? '#22c55e' : (d.total === 0 ? '#94a3b8' : '#ef4444');
-    
     div.className = '';
     div.innerHTML = `
       <div class="card" style="text-align:center;">
@@ -964,97 +859,7 @@ init();
 """
 
 ADMIN_HTML = r"""<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Admin - NBA Signals</title>
-<style>
-  :root{--bg:#0f172a;--card:#1e293b;--txt:#e2e8f0;--muted:#94a3b8;--red:#ef4444;--green:#22c55e;}
-  body{font-family:-apple-system,system-ui;margin:0;padding:16px;background:var(--bg);color:var(--txt);}
-  h1{font-size:22px;margin-bottom:16px;}
-  table{width:100%;border-collapse:collapse;margin-top:16px;background:var(--card);border-radius:8px;overflow:hidden;}
-  th,td{padding:12px;text-align:left;border-bottom:1px solid #334155;font-size:14px;}
-  th{background:#1e293b;color:var(--muted);font-weight:600;text-transform:uppercase;font-size:12px;}
-  tr:last-child td{border-bottom:none;}
-  .badge{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;}
-  .bg-green{background:#14532d;color:#86efac;}
-  .bg-red{background:#7f1d1d;color:#fca5a5;}
-  .bg-gray{background:#334155;color:#cbd5e1;}
-  button{padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-weight:bold;color:#fff;}
-  .btn-block{background:var(--red);}
-  .btn-unblock{background:var(--green);}
-</style>
-</head><body>
-<h1>🕵️‍♂️ Panel de Administrador</h1>
-<p class="hint">Lista de usuarios registrados en el bot.</p>
-
-<table id="usersTable">
-  <thead>
-    <tr>
-      <th>ID Usuario</th>
-      <th>Fecha Registro</th>
-      <th>Estado</th>
-      <th>Acciones</th>
-    </tr>
-  </thead>
-  <tbody id="usersBody">
-    <tr><td colspan="4" style="text-align:center;">Cargando...</td></tr>
-  </tbody>
-</table>
-
-<script>
-const urlParams = new URLSearchParams(window.location.search);
-const passwd = urlParams.get('passwd');
-
-async function loadUsers() {
-  const res = await fetch(`/api/admin/users?passwd=${passwd}`);
-  if (!res.ok) {
-    document.getElementById('usersBody').innerHTML = '<tr><td colspan="4" style="color:red;">Error de autenticación. Revisa tu contraseña.</td></tr>';
-    return;
-  }
-  const users = await res.json();
-  const tbody = document.getElementById('usersBody');
-  
-  if (users.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;">No hay usuarios registrados.</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = users.map(u => {
-    const status = u.is_blocked ? '<span class="badge bg-red">BLOQUEADO</span>' : '<span class="badge bg-green">ACTIVO</span>';
-    const botState = u.active ? '🟢' : '⚪';
-    const autoState = u.auto_mode ? '🎯' : '';
-    const date = new Date(u.created_at).toLocaleString();
-    
-    return `<tr>
-      <td><code>${u.id}</code></td>
-      <td>${date}</td>
-      <td>${status} ${botState} ${autoState}</td>
-      <td>
-        <button class="${u.is_blocked ? 'btn-unblock' : 'btn-block'}" onclick="toggleBlock('${u.id}', ${u.is_blocked})">
-          ${u.is_blocked ? 'Desbloquear' : 'Bloquear'}
-        </button>
-      </td>
-    </tr>`;
-  }).join('');
-}
-
-async function toggleBlock(userId, isCurrentlyBlocked) {
-  const action = isCurrentlyBlocked ? 'desbloquear' : 'bloquear';
-  if (!confirm(`¿Estás seguro de que quieres ${action} a este usuario?`)) return;
-
-  const res = await fetch(`/api/admin/block/${userId}?passwd=${passwd}`, { method: 'POST' });
-  if (res.ok) {
-    loadUsers();
-  } else {
-    alert('Error al cambiar el estado del usuario.');
-  }
-}
-
-loadUsers();
-</script>
-</body></html>
-"""
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Admin</title><style>:root{--bg:#0f172a;--card:#1e293b;--txt:#e2e8f0;--muted:#94a3b8;--red:#ef4444;--green:#22c55e;}body{font-family:-apple-system,system-ui;margin:0;padding:16px;background:var(--bg);color:var(--txt);}h1{font-size:22px;margin-bottom:16px;}table{width:100%;border-collapse:collapse;margin-top:16px;background:var(--card);border-radius:8px;overflow:hidden;}th,td{padding:12px;text-align:left;border-bottom:1px solid #334155;font-size:14px;}th{background:#1e293b;color:var(--muted);font-weight:600;text-transform:uppercase;font-size:12px;}tr:last-child td{border-bottom:none;}.badge{padding:4px 8px;border-radius:4px;font-size:12px;font-weight:bold;}.bg-green{background:#14532d;color:#86efac;}.bg-red{background:#7f1d1d;color:#fca5a5;}button{padding:6px 12px;border:none;border-radius:4px;cursor:pointer;font-weight:bold;color:#fff;}.btn-block{background:var(--red);}.btn-unblock{background:var(--green);}</style></head><body><h1>🕵️‍♂️ Panel de Administrador</h1><p class="hint">Lista de usuarios registrados en el bot.</p><table><thead><tr><th>ID Usuario</th><th>Fecha Registro</th><th>Estado</th><th>Acciones</th></tr></thead><tbody id="usersBody"><tr><td colspan="4" style="text-align:center;">Cargando...</td></tr></tbody></table><script>const urlParams = new URLSearchParams(window.location.search);const passwd = urlParams.get('passwd');async function loadUsers() {const res = await fetch(`/api/admin/users?passwd=${passwd}`);if (!res.ok) {document.getElementById('usersBody').innerHTML = '<tr><td colspan="4" style="color:red;">Error de autenticación. Revisa tu contraseña.</td></tr>';return;}const users = await res.json();const tbody = document.getElementById('usersBody');if (users.length === 0) {tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;">No hay usuarios registrados.</td></tr>';return;}tbody.innerHTML = users.map(u => {const status = u.is_blocked ? '<span class="badge bg-red">BLOQUEADO</span>' : '<span class="badge bg-green">ACTIVO</span>';const botState = u.active ? '🟢' : '⚪';const autoState = u.auto_mode ? '🎯' : '';const date = new Date(u.created_at).toLocaleString();return `<tr><td><code>${u.id}</code></td><td>${date}</td><td>${status} ${botState} ${autoState}</td><td><button class="${u.is_blocked ? 'btn-unblock' : 'btn-block'}" onclick="toggleBlock('${u.id}', ${u.is_blocked})">${u.is_blocked ? 'Desbloquear' : 'Bloquear'}</button></td></tr>`;}).join('');}async function toggleBlock(userId, isCurrentlyBlocked) {const action = isCurrentlyBlocked ? 'desbloquear' : 'bloquear';if (!confirm(`¿Estás seguro de que quieres ${action} a este usuario?`)) return;const res = await fetch(`/api/admin/block/${userId}?passwd=${passwd}`, { method: 'POST' });if (res.ok) {loadUsers();} else {alert('Error al cambiar el estado del usuario.');}}loadUsers();</script></body></html>"""
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
