@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3/Q4 + Panel Admin + Estadísticas + Anti-Cruce + Odds Frescas)
+Bot NBA - Multi-usuario (Full Game + Piloto Automático HT/Q3/Q4 + Panel Admin + Estadísticas + Anti-Cruce + InferSports API)
 """
 import os, sqlite3, requests
 from datetime import datetime, timezone
@@ -25,7 +25,7 @@ def init_db():
         con.executescript("""
         CREATE TABLE IF NOT EXISTS users(
             id TEXT PRIMARY KEY,
-            odds_key TEXT NOT NULL,
+            odds_key TEXT DEFAULT "",
             tg_token TEXT DEFAULT "",
             tg_chat_id TEXT DEFAULT "",
             active INTEGER DEFAULT 0,
@@ -43,22 +43,13 @@ def init_db():
             status TEXT DEFAULT 'PENDING',
             final_total INTEGER);
         """)
-        try:
-            con.execute("ALTER TABLE users ADD COLUMN auto_mode INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            con.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            con.execute("ALTER TABLE signals ADD COLUMN status TEXT DEFAULT 'PENDING'")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            con.execute("ALTER TABLE signals ADD COLUMN final_total INTEGER")
-        except sqlite3.OperationalError:
-            pass
+        for col in ["auto_mode INTEGER DEFAULT 0", "is_blocked INTEGER DEFAULT 0"]:
+            try: con.execute(f"ALTER TABLE users ADD COLUMN {col}")
+            except: pass
+        try: con.execute("ALTER TABLE signals ADD COLUMN status TEXT DEFAULT 'PENDING'")
+        except: pass
+        try: con.execute("ALTER TABLE signals ADD COLUMN final_total INTEGER")
+        except: pass
 
 def espn_games():
     try:
@@ -90,75 +81,64 @@ def espn_games():
         print(f"[espn] {e}")
         return []
 
-def odds_totals(api_key):
+def odds_totals_infer():
+    """Obtiene cuotas en vivo desde InferSports y las empareja con los nombres de ESPN"""
     try:
-        r = requests.get(
-            "https://api.the-odds-api.com/v4/sports/basketball_nba/odds/",
-            params={"apiKey": api_key, "regions": "us,eu",
-                    "markets": "totals", "oddsFormat": "decimal"},
-            timeout=15)
+        r = requests.get("https://api.infersports.dev/v1/events/live", timeout=15)
         if r.status_code != 200:
             return {}
-        out = {}
         
-        for m in r.json():
-            matchup = f"{m['away_team']} vs {m['home_team']}"
+        eventos_infer = [ev for ev in r.json().get("data", []) 
+                         if ev.get("sport") == "basketball" and ev.get("league", {}).get("name") == "NBA"]
+        
+        odds_dict = {}
+        for ev in eventos_infer:
+            event_id = ev["id"]
+            # InferSports usa nombres cortos (Ej: N.Y.Knicks) y ESPN usa largos (New York Knicks)
+            # Extraemos la parte importante después del punto: "Knicks"
+            home_short = ev["home_team"]["name"].split(".")[-1].strip()
+            away_short = ev["away_team"]["name"].split(".")[-1].strip()
             
-            # Buscar la cuota MÁS FRESCA entre todas las casas de apuestas
-            best_bm = None
-            best_time = None
-            
-            for bm in m.get("bookmakers", []):
-                last_update_str = bm.get("last_update")
-                if not last_update_str:
-                    continue
-                try:
-                    lu = datetime.fromisoformat(last_update_str.replace('Z', '+00:00'))
-                except Exception:
-                    continue
-                
-                # Verificamos si tiene mercado de totales
-                mk = next((x for x in bm.get("markets", []) if x.get("key") == "totals"), None)
-                if not mk:
-                    continue
-                    
-                if best_time is None or lu > best_time:
-                    best_time = lu
-                    best_bm = bm
-            
-            if not best_bm:
+            r_odds = requests.get(f"https://api.infersports.dev/v1/events/{event_id}/odds?format=decimal", timeout=15)
+            if r_odds.status_code != 200:
                 continue
                 
-            # Calcular antigüedad en minutos
-            now = datetime.now(timezone.utc)
-            minutos_viejos = (now - best_time).total_seconds() / 60.0
+            odds_data = r_odds.json()
             
-            # Si la cuota más fresca tiene más de 5 minutos, la ignoramos por seguridad
-            if minutos_viejos > 5:
-                print(f"[ODDS VIEJAS] {matchup} ({best_bm.get('title')}) actualizada hace {minutos_viejos:.1f} min. Ignorada.")
-                continue
-
-            mk = next((x for x in best_bm.get("markets", []) if x.get("key") == "totals"), None)
-            line = over = under = None
-            for o in mk.get("outcomes", []):
-                if "point" in o and "price" in o:
-                    line = float(o["point"])
-                    if o.get("name", "").lower() == "over":
-                        over = float(o["price"])
-                    elif o.get("name", "").lower() == "under":
-                        under = float(o["price"])
+            mejor_linea = None
+            mejor_cuota_over = None
+            mejor_cuota_under = None
+            mejor_time = None
+            
+            for odd in odds_data.get("odds", []):
+                if odd.get("market_type") == "totals" and odd.get("period") == "full_time" and odd.get("status") == "open":
+                    as_of_str = odd.get("as_of")
+                    try:
+                        as_of_time = datetime.fromisoformat(as_of_str.replace('Z', '+00:00'))
+                    except:
+                        continue
                         
-            if line is not None:
-                out[matchup] = {
-                    "line": line, 
-                    "over": over, 
-                    "under": under,
-                    "bookmaker": best_bm.get("title", "Desconocida"),
-                    "age_min": minutos_viejos
+                    if mejor_time is None or as_of_time > mejor_time:
+                        mejor_time = as_of_time
+                        mejor_linea = odd.get("line")
+                        mejor_cuota_over = odd["prices"].get("over")
+                        mejor_cuota_under = odd["prices"].get("under")
+            
+            if mejor_linea is not None:
+                now = datetime.now(timezone.utc)
+                age_min = (now - mejor_time).total_seconds() / 60.0
+                
+                # Guardamos usando un formato que podamos buscar luego
+                odds_dict[f"{away_short} vs {home_short}"] = {
+                    "line": float(mejor_linea),
+                    "over": float(mejor_cuota_over),
+                    "under": float(mejor_cuota_under),
+                    "bookmaker": "InferSports",
+                    "age_min": age_min
                 }
-        return out
+        return odds_dict
     except Exception as e:
-        print(f"[odds] {e}")
+        print(f"[odds infer error] {e}")
         return {}
 
 def minutes_played(period, clock, status=""):
@@ -206,15 +186,13 @@ def format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False):
     cuota = ln["over"] if decision == "OVER" else ln["under"]
     cuota_str = f"{cuota:.2f}" if cuota else "N/A"
     color = "🟢" if decision == "OVER" else "🔴"
-    modo = "AUTO (HT/Q3/Q4)" if auto else "FULL GAME"
-    bookie = ln.get("bookmaker", "Desconocida")
-    age = ln.get("age_min", 0)
+    modo = "AUTO" if auto else "MANUAL"
     
     return (
         f"📡 <b>SEÑAL EN VIVO — NBA ({modo})</b>\n\n"
         f"🏀 <b>{matchup}</b>\n"
-        f"📌 <b>Línea ({bookie}):</b> {ln['line']:.1f}\n"
-        f"🔄 <b>Actualizada hace:</b> {age:.1f} min\n"
+        f"📌 <b>Línea ({ln['bookmaker']}):</b> {ln['line']:.1f}\n"
+        f"🔄 <b>Actualizada:</b> hace {ln.get('age_min', 0):.1f} min\n"
         f"⏱️ <b>Estado:</b> P{g['period']} ({g['clock']})\n\n"
         f"📈 <b>Proyección final:</b> {proj:.1f}\n"
         f"🔻 <b>Diferencia:</b> {diff:+.1f} pts\n"
@@ -233,7 +211,6 @@ def check_results():
         games = {g["matchup"]: g for g in espn_games()}
         for sig in pending:
             g = games.get(sig["matchup"])
-            # AQUÍ ESTÁ LA CORRECCIÓN (Solo si el estado es "post")
             if g and g["state"] == "post":
                 final_total = g["total"]
                 line = sig["line"]
@@ -263,6 +240,19 @@ def poll():
         if not games:
             return
 
+        # OBTENER CUOTAS DE INFERSPORTS UNA VEZ POR CICLO
+        infer_odds = odds_totals_infer()
+        
+        # EMPAREJAR NOMBRES (ESPN largo vs InferSports corto)
+        matched_odds = {}
+        for real_match in games.keys():
+            for short_match, ln in infer_odds.items():
+                away_short, home_short = short_match.split(" vs ")
+                # Si "Knicks" está en "N.Y.Knicks vs Bo.Celtics" y "Celtics" también
+                if away_short in real_match and home_short in real_match:
+                    matched_odds[real_match] = ln
+                    break
+
         for u in users:
             try:
                 if u["auto_mode"]:
@@ -276,10 +266,9 @@ def poll():
                     if not target_games:
                         continue
                         
-                    odds = odds_totals(u["odds_key"])
                     for g in target_games:
                         matchup = g["matchup"]
-                        ln = odds.get(matchup)
+                        ln = matched_odds.get(matchup)
                         if not ln:
                             continue
                         
@@ -342,10 +331,9 @@ def poll():
                     if not live:
                         continue
 
-                    odds = odds_totals(u["odds_key"])
                     for matchup in live:
                         g = games[matchup]
-                        ln = odds.get(matchup)
+                        ln = matched_odds.get(matchup)
                         if not ln:
                             continue
                         mins = minutes_played(g["period"], g["clock"], g["status"])
@@ -390,7 +378,7 @@ def poll():
 # FASTAPI APP
 # =========================
 class UserCfg(BaseModel):
-    odds_key: str
+    odds_key: str = ""
     tg_token: str = ""
     tg_chat_id: str = ""
 
@@ -410,32 +398,13 @@ def startup():
 
 @app.post("/api/user/test")
 def test_user(body: UserCfg):
-    errors, tg_user = [], None
+    errors = []
     if body.tg_token:
         try:
             r = requests.get(f"https://api.telegram.org/bot{body.tg_token}/getMe", timeout=10)
-            d = r.json()
-            if r.status_code == 200 and d.get("ok"):
-                tg_user = d["result"]["username"]
-            else:
-                errors.append(f"Telegram invalido ({r.status_code})")
-        except Exception as e:
-            errors.append(f"Telegram: {e}")
-
-    remaining = None
-    try:
-        r = requests.get(
-            "https://api.the-odds-api.com/v4/sports/basketball_nba/odds/",
-            params={"apiKey": body.odds_key, "regions": "us", "markets": "totals"},
-            timeout=15)
-        if r.status_code == 200:
-            remaining = r.headers.get("x-requests-remaining")
-        else:
-            errors.append(f"TheOddsAPI {r.status_code}")
-    except Exception as e:
-        errors.append(f"TheOddsAPI: {e}")
-
-    return {"ok": not errors, "errors": errors, "tg_user": tg_user, "odds_remaining": remaining}
+            if r.status_code != 200: errors.append("Telegram inválido")
+        except: errors.append("Error de Telegram")
+    return {"ok": not errors, "errors": errors, "tg_user": "OK", "odds_remaining": "InferSports (Gratis)"}
 
 @app.post("/api/user")
 def save_user(body: UserCfg, x_user_id: str = Header(None)):
@@ -448,8 +417,7 @@ def save_user(body: UserCfg, x_user_id: str = Header(None)):
         con.execute(
             "INSERT INTO users(id, odds_key, tg_token, tg_chat_id, created_at) "
             "VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-            "odds_key=excluded.odds_key, tg_token=excluded.tg_token, "
-            "tg_chat_id=excluded.tg_chat_id",
+            "tg_token=excluded.tg_token, tg_chat_id=excluded.tg_chat_id",
             (x_user_id, body.odds_key, body.tg_token, body.tg_chat_id,
              datetime.now().isoformat()))
         con.commit()
@@ -662,9 +630,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="settings" class="hidden">
   <div class="card">
     <h2>Tus credenciales</h2>
-    <p class="hint">Cada usuario usa sus propias claves. Se guardan en este servidor.</p>
-    <label class="hint">TheOddsAPI key (Obligatoria)</label>
-    <input class="field" id="oddsKey" placeholder="ej: 8685233a768b4d44...">
+    <p class="hint">Ya no necesitas clave de TheOddsAPI, usamos InferSports (Gratis).</p>
     <label class="hint">Telegram bot token (Opcional)</label>
     <input class="field" id="tgToken" placeholder="ej: 7726757580:AAH...">
     <label class="hint">Telegram chat ID (Opcional)</label>
@@ -746,10 +712,8 @@ async function loadUser() {
     }
     if (r.status === 200) {
       const data = await r.json();
-      document.getElementById('oddsKey').value = '';
       document.getElementById('tgToken').value = '';
       document.getElementById('tgChat').value = data.tg_chat_id || '';
-      document.getElementById('oddsKey').placeholder = 'Guardada: ' + data.odds_key;
       document.getElementById('tgToken').placeholder = 'Guardado: ' + data.tg_token;
       
       const btn = document.getElementById('vigilanciaBtn');
@@ -778,16 +742,10 @@ async function loadUser() {
 }
 
 async function saveUser() {
-  const odds = document.getElementById('oddsKey').value.trim();
   const tk = document.getElementById('tgToken').value.trim();
   const chat = document.getElementById('tgChat').value.trim();
   const msg = document.getElementById('settingsMsg');
   
-  if (!odds) {
-    msg.className = 'msg err';
-    msg.textContent = 'La clave de TheOddsAPI es obligatoria';
-    return;
-  }
   if ((tk && !chat) || (!tk && chat)) {
     msg.className = 'msg err';
     msg.textContent = 'Si usas Telegram, debes llenar Token y Chat ID';
@@ -797,7 +755,7 @@ async function saveUser() {
   const r = await api('/api/user', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({odds_key: odds, tg_token: tk, tg_chat_id: chat})
+    body: JSON.stringify({tg_token: tk, tg_chat_id: chat})
   });
   if (r.ok) {
     msg.className = 'msg ok';
@@ -813,29 +771,22 @@ async function saveUser() {
 }
 
 async function testUser() {
-  const odds = document.getElementById('oddsKey').value.trim();
   const tk = document.getElementById('tgToken').value.trim();
   const chat = document.getElementById('tgChat').value.trim();
   const msg = document.getElementById('settingsMsg');
-  
-  if (!odds) {
-    msg.className = 'msg err';
-    msg.textContent = 'La clave de TheOddsAPI es obligatoria';
-    return;
-  }
   
   msg.className = 'msg';
   msg.textContent = 'Probando...';
   const r = await api('/api/user/test', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({odds_key: odds, tg_token: tk, tg_chat_id: chat})
+    body: JSON.stringify({tg_token: tk, tg_chat_id: chat})
   });
   const d = await r.json();
   if (d.ok) {
     msg.className = 'msg ok';
     let extra = d.tg_user ? '<br>Bot: @' + d.tg_user : '<br>Telegram: No configurado';
-    msg.innerHTML = 'OK' + extra + '<br>Creditos restantes: ' + d.odds_remaining;
+    msg.innerHTML = 'OK' + extra + '<br>API Cuotas: ' + d.odds_remaining;
   } else {
     msg.className = 'msg err';
     msg.textContent = 'Error: ' + d.errors.join(' | ');
@@ -1038,12 +989,11 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       <th>ID Usuario</th>
       <th>Fecha Registro</th>
       <th>Estado</th>
-      <th>Odds API</th>
       <th>Acciones</th>
     </tr>
   </thead>
   <tbody id="usersBody">
-    <tr><td colspan="5" style="text-align:center;">Cargando...</td></tr>
+    <tr><td colspan="4" style="text-align:center;">Cargando...</td></tr>
   </tbody>
 </table>
 
@@ -1054,14 +1004,14 @@ const passwd = urlParams.get('passwd');
 async function loadUsers() {
   const res = await fetch(`/api/admin/users?passwd=${passwd}`);
   if (!res.ok) {
-    document.getElementById('usersBody').innerHTML = '<tr><td colspan="5" style="color:red;">Error de autenticación. Revisa tu contraseña.</td></tr>';
+    document.getElementById('usersBody').innerHTML = '<tr><td colspan="4" style="color:red;">Error de autenticación. Revisa tu contraseña.</td></tr>';
     return;
   }
   const users = await res.json();
   const tbody = document.getElementById('usersBody');
   
   if (users.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">No hay usuarios registrados.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;">No hay usuarios registrados.</td></tr>';
     return;
   }
 
@@ -1075,7 +1025,6 @@ async function loadUsers() {
       <td><code>${u.id}</code></td>
       <td>${date}</td>
       <td>${status} ${botState} ${autoState}</td>
-      <td>${u.odds_key}</td>
       <td>
         <button class="${u.is_blocked ? 'btn-unblock' : 'btn-block'}" onclick="toggleBlock('${u.id}', ${u.is_blocked})">
           ${u.is_blocked ? 'Desbloquear' : 'Bloquear'}
