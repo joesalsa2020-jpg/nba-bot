@@ -227,6 +227,7 @@ def check_results():
 
 def poll():
     try:
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] --- INICIANDO REVISIÓN ---")
         with db() as con:
             users = con.execute("SELECT * FROM users WHERE (active = 1 OR auto_mode = 1) AND is_blocked = 0").fetchall()
         if not users:
@@ -237,12 +238,18 @@ def poll():
             return
 
         infer_odds = odds_totals_infer()
+        print(f"[POLL] ESPN: {len(games)} partidos | InferSports: {len(infer_odds)} partidos con cuotas.")
         
         matched_odds = {}
         for real_match in games.keys():
             for short_match, ln in infer_odds.items():
-                away_short, home_short = short_match.split(" vs ")
-                if away_short in real_match and home_short in real_match:
+                # EL TRADUCTOR DEFINITIVO (Última palabra del equipo)
+                away_short = short_match.split(" vs ")[0].split()[-1].lower()
+                home_short = short_match.split(" vs ")[1].split()[-1].lower()
+                
+                real_lower = real_match.lower()
+                
+                if away_short in real_lower and home_short in real_lower:
                     matched_odds[real_match] = ln
                     break
 
@@ -279,6 +286,8 @@ def poll():
                         if proj is None:
                             continue
                         diff = proj - ln["line"]
+                        print(f"[EVAL] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
+                        
                         if abs(diff) < MIN_DIFF:
                             continue
 
@@ -335,6 +344,8 @@ def poll():
                         if proj is None:
                             continue
                         diff = proj - ln["line"]
+                        print(f"[EVAL MANUAL] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
+                        
                         if abs(diff) < MIN_DIFF:
                             continue
 
