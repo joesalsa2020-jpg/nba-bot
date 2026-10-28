@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (InferSports PRO + Respaldo + Garbage Time + Recency Bias + Anchor Line)
+Bot NBA - Multi-usuario (InferSports PRO + Respaldo + Garbage Time + Recency Bias + Anchor Line + FIX Halftime)
 """
 import os, sqlite3, requests
 from datetime import datetime, timezone
@@ -95,12 +95,10 @@ def espn_games():
         return []
 
 def get_anchor_line(con, matchup, current_line):
-    """Busca la línea ancla o la guarda si no existe"""
     row = con.execute("SELECT initial_line FROM anchors WHERE matchup=?", (matchup,)).fetchone()
     if row:
         return row["initial_line"]
     else:
-        # Si no existe, usamos la línea actual como ancla inicial
         con.execute("INSERT INTO anchors(matchup, initial_line) VALUES(?,?)", (matchup, current_line))
         con.commit()
         return current_line
@@ -208,31 +206,35 @@ def minutes_played(period, clock, status=""):
         except Exception: pass
     return mins
 
-def project_total_hibrida(total, minutes, period, q_home, q_away, anchor_line):
+def project_total_hibrida(total, minutes, period, status, q_home, q_away, anchor_line):
     if minutes <= 0.1: return None
     
-    # 1. Calcular Proyección en Vivo con Recency Bias
+    # 1. Calcular cuartos completados correctamente
+    completed_quarters = max(0, period - 1)
+    if "Half" in status or "Halftime" in status:
+        completed_quarters = 2
+    elif "End" in status:
+        completed_quarters = period
+        
     q_pts = []
-    for i in range(min(period - 1, len(q_home), len(q_away))):
+    for i in range(min(completed_quarters, len(q_home), len(q_away))):
         try: q_pts.append(int(q_home[i].get("value", 0)) + int(q_away[i].get("value", 0)))
         except: pass
         
+    # 2. Calcular Proyección en Vivo con Recency Bias
     if q_pts:
         weights = list(range(1, len(q_pts) + 1))
         weighted_sum = sum(p * w for p, w in zip(q_pts, weights))
         total_weight = sum(weights)
         avg_weighted = weighted_sum / total_weight
-        cuartos_restantes = 4 - len(q_pts)
+        cuartos_restantes = max(0, 4 - len(q_pts))
         live_proj = total + (avg_weighted * cuartos_restantes)
     else:
         total_min = 48.0 if period <= 4 else 48.0 + (period - 4) * 5.0
         live_proj = (total / minutes) * total_min
 
-    # 2. Mezclar con la Línea Ancla (Anchor Line)
-    # Al inicio del partido (Q1/Q2), pesa más el histórico (Anchor). En Q4, pesa más el en vivo.
+    # 3. Mezclar con la Línea Ancla
     weight_live = min(1.0, max(0.0, minutes / 48.0)) 
-    
-    # Blend final
     final_proj = (live_proj * weight_live) + (anchor_line * (1.0 - weight_live))
     
     return final_proj
@@ -375,12 +377,11 @@ def poll():
                             
                         mins = minutes_played(g["period"], g["clock"], g["status"])
                         
-                        # OBTENER LÍNEA ANCLA
                         with db() as con:
                             anchor = get_anchor_line(con, matchup, ln["line"])
                             
-                        # PROYECCIÓN HÍBRIDA
-                        proj = project_total_hibrida(g["total"], mins, g["period"], g["q_home"], g["q_away"], anchor)
+                        # PASAMOS EL STATUS A LA FUNCIÓN CORREGIDA
+                        proj = project_total_hibrida(g["total"], mins, g["period"], g["status"], g["q_home"], g["q_away"], anchor)
                         
                         if proj is None: continue
                         diff = proj - ln["line"]
@@ -425,11 +426,10 @@ def poll():
                             
                         mins = minutes_played(g["period"], g["clock"], g["status"])
                         
-                        # OBTENER LÍNEA ANCLA
                         with db() as con:
                             anchor = get_anchor_line(con, matchup, ln["line"])
                             
-                        proj = project_total_hibrida(g["total"], mins, g["period"], g["q_home"], g["q_away"], anchor)
+                        proj = project_total_hibrida(g["total"], mins, g["period"], g["status"], g["q_home"], g["q_away"], anchor)
                         
                         if proj is None: continue
                         diff = proj - ln["line"]
