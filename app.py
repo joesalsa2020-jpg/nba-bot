@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (InferSports PRO + Respaldo TheOddsAPI + Filtro Garbage Time)
+Bot NBA - Multi-usuario (InferSports PRO + Respaldo TheOddsAPI + Filtro Garbage Time + Recency Bias)
 """
 import os, sqlite3, requests
 from datetime import datetime, timezone
@@ -71,9 +71,11 @@ def espn_games():
             at = away.get("team", {}).get("displayName", "Away")
             st = ev.get("status", {})
             
-            # EXTRAEMOS PUNTOS POR SEPARADO PARA EL FILTRO GARBAGE TIME
-            home_score = sum(int(q.get("value", 0)) for q in home.get("linescores", []))
-            away_score = sum(int(q.get("value", 0)) for q in away.get("linescores", []))
+            # EXTRAEMOS PUNTOS POR SEPARADO Y LOS CUARTOS PARA EL RECENCY BIAS
+            q_home = home.get("linescores", [])
+            q_away = away.get("linescores", [])
+            home_score = sum(int(q.get("value", 0)) for q in q_home)
+            away_score = sum(int(q.get("value", 0)) for q in q_away)
             
             out.append({
                 "matchup": f"{at} vs {ht}",
@@ -84,6 +86,8 @@ def espn_games():
                 "total": home_score + away_score,
                 "home_score": home_score,
                 "away_score": away_score,
+                "q_home": q_home,
+                "q_away": q_away,
             })
         return out
     except Exception as e:
@@ -209,10 +213,32 @@ def minutes_played(period, clock, status=""):
         except Exception: pass
     return mins
 
-def project_total(total, minutes, period):
+def project_total_recency(total, minutes, period, q_home, q_away):
     if minutes <= 0.1: return None
-    total_min = 48.0 if period <= 4 else 48.0 + (period - 4) * 5.0
-    return (total / minutes) * total_min
+    
+    # 1. Extraer los puntos por cuarto
+    q_pts = []
+    for i in range(min(period - 1, len(q_home), len(q_away))):
+        try:
+            q_pts.append(int(q_home[i].get("value", 0)) + int(q_away[i].get("value", 0)))
+        except: pass
+        
+    if not q_pts:
+        # Si no hay cuartos completos, usar proyección lineal base
+        total_min = 48.0 if period <= 4 else 48.0 + (period - 4) * 5.0
+        return (total / minutes) * total_min
+
+    # 2. Aplicar Recency Bias (Pesos: Q1=1, Q2=2, Q3=3...)
+    weights = list(range(1, len(q_pts) + 1))
+    weighted_sum = sum(p * w for p, w in zip(q_pts, weights))
+    total_weight = sum(weights)
+    avg_weighted = weighted_sum / total_weight
+    
+    # 3. Proyección: Puntos actuales + (promedio ponderado * cuartos restantes)
+    cuartos_restantes = 4 - len(q_pts)
+    proyeccion = total + (avg_weighted * cuartos_restantes)
+    
+    return proyeccion
 
 def send_tg(token, chat_id, msg):
     try:
@@ -276,7 +302,7 @@ def poll():
         games = {g["matchup"]: g for g in espn_games()}
         if not games: return
 
-        # PASO 1: Verificar si hay partidos válidos (HT, Q3, Q4) Y FILTRO GARBAGE TIME
+        # PASO 1: Verificar partidos válidos + FILTRO GARBAGE TIME
         partidos_validos = []
         for g in games.values():
             is_ht = "Half" in g["status"]
@@ -307,14 +333,12 @@ def poll():
             partidos_validos.append(g)
                 
         if not partidos_validos:
-            return # No hay partidos válidos, no gastamos APIs
+            return
 
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] --- INICIANDO REVISIÓN ({len(partidos_validos)} partidos válidos) ---")
         
-        # PASO 2: Intentar obtener cuotas de InferSports (Primera opción)
         infer_odds = odds_totals_infer()
         
-        # PASO 3: Emparejar cuotas de InferSports
         matched_odds = {}
         for g in partidos_validos:
             real_match = g["matchup"]
@@ -326,7 +350,6 @@ def poll():
                     matched_odds[real_match] = ln
                     break
         
-        # PASO 4: Si hay partidos válidos sin cuota, usar TheOddsAPI (Plan B)
         faltantes = [g for g in partidos_validos if g["matchup"] not in matched_odds]
         if faltantes:
             print(f"[PLAN B] InferSports falló o no tiene cuotas para {len(faltantes)} partidos. Usando TheOddsAPI...")
@@ -345,7 +368,6 @@ def poll():
 
         print(f"[POLL] Cuotas totales obtenidas: {len(matched_odds)}")
 
-        # PASO 5: Procesar señales
         for u in users:
             try:
                 if u["auto_mode"]:
@@ -359,7 +381,10 @@ def poll():
                         if already_sent: continue
                             
                         mins = minutes_played(g["period"], g["clock"], g["status"])
-                        proj = project_total(g["total"], mins, g["period"])
+                        
+                        # USAMOS LA NUEVA FUNCIÓN CON RECENCY BIAS
+                        proj = project_total_recency(g["total"], mins, g["period"], g["q_home"], g["q_away"])
+                        
                         if proj is None: continue
                         diff = proj - ln["line"]
                         
@@ -368,7 +393,10 @@ def poll():
 
                         decision = "OVER" if diff > 0 else "UNDER"
                         cuota = ln["over"] if decision == "OVER" else ln["under"]
-                        conf = min(99, max(10, int((abs(diff) / 20) * 100 * (mins / 48))))
+                        
+                        # NUEVA CONFIANZA (Más agresiva en diferencias grandes)
+                        conf = min(99, max(10, int((abs(diff) / 15) * 100 * (mins / 48))))
+                        
                         msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=True)
 
                         with db() as con:
@@ -402,7 +430,8 @@ def poll():
                             continue
                             
                         mins = minutes_played(g["period"], g["clock"], g["status"])
-                        proj = project_total(g["total"], mins, g["period"])
+                        proj = project_total_recency(g["total"], mins, g["period"], g["q_home"], g["q_away"])
+                        
                         if proj is None: continue
                         diff = proj - ln["line"]
                         
@@ -411,7 +440,8 @@ def poll():
 
                         decision = "OVER" if diff > 0 else "UNDER"
                         cuota = ln["over"] if decision == "OVER" else ln["under"]
-                        conf = min(99, max(10, int((abs(diff) / 20) * 100 * (mins / 48))))
+                        conf = min(99, max(10, int((abs(diff) / 15) * 100 * (mins / 48))))
+                        
                         msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False)
 
                         with db() as con:
