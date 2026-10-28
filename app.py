@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (InferSports PRO + Respaldo TheOddsAPI)
+Bot NBA - Multi-usuario (InferSports PRO + Respaldo TheOddsAPI + Filtro Garbage Time)
 """
 import os, sqlite3, requests
 from datetime import datetime, timezone
@@ -15,10 +15,10 @@ MIN_DIFF = 7.0
 DB = "nba.db"
 ADMIN_PASS = "admin123"  # 👈 CAMBIA ESTO POR TU CONTRASEÑA SECRETA
 
-# 🔑 AQUÍ VA TU CLAVE DE INFERSPORTS (La que copiaste en la web)
+# 🔑 AQUÍ VA TU CLAVE DE INFERSPORTS
 INFER_API_KEY = "isk_sbSsZl0rFrEbscbN0NHb4_K_qEwfF5Kl" 
 
-# 🔑 AQUÍ VA TU CLAVE DE THEODDSAPI (El respaldo por si InferSports falla)
+# 🔑 AQUÍ VA TU CLAVE DE THEODDSAPI
 THEODDS_API_KEY = "2cc2dfc1b911c94ebd39d2909668831c"
 
 def db():
@@ -70,13 +70,20 @@ def espn_games():
             ht = home.get("team", {}).get("displayName", "Home")
             at = away.get("team", {}).get("displayName", "Away")
             st = ev.get("status", {})
+            
+            # EXTRAEMOS PUNTOS POR SEPARADO PARA EL FILTRO GARBAGE TIME
+            home_score = sum(int(q.get("value", 0)) for q in home.get("linescores", []))
+            away_score = sum(int(q.get("value", 0)) for q in away.get("linescores", []))
+            
             out.append({
                 "matchup": f"{at} vs {ht}",
                 "status": st.get("type", {}).get("description", ""),
                 "state": st.get("type", {}).get("state", ""),
                 "period": int(st.get("period", 0) or 0),
                 "clock": st.get("displayClock", "") or "",
-                "total": sum(int(q.get("value", 0)) for q in (home.get("linescores", []) + away.get("linescores", []))),
+                "total": home_score + away_score,
+                "home_score": home_score,
+                "away_score": away_score,
             })
         return out
     except Exception as e:
@@ -88,7 +95,7 @@ def odds_totals_infer():
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'application/json',
-            'Authorization': f'Bearer {INFER_API_KEY}'  # <--- Autenticación con tu clave PRO
+            'Authorization': f'Bearer {INFER_API_KEY}'
         }
         r = requests.get("https://api.infersports.dev/v1/events/live", headers=headers, timeout=15)
         
@@ -143,7 +150,6 @@ def odds_totals_infer():
         return {}
 
 def odds_totals_theoddsapi(api_key):
-    """Plan B: Obtiene cuotas de TheOddsAPI si InferSports falla"""
     try:
         r = requests.get(
             "https://api.the-odds-api.com/v4/sports/basketball_nba/odds/",
@@ -156,7 +162,6 @@ def odds_totals_theoddsapi(api_key):
         out = {}
         for m in r.json():
             matchup = f"{m['away_team']} vs {m['home_team']}"
-            # Buscar la casa de apuestas (prioridad Pinnacle, sino la primera)
             bm = next((b for b in m.get("bookmakers", []) if b.get("key") == "pinnacle"), None) \
                  or (m.get("bookmakers") or [None])[0]
             if not bm: continue
@@ -271,13 +276,35 @@ def poll():
         games = {g["matchup"]: g for g in espn_games()}
         if not games: return
 
-        # PASO 1: Verificar si hay partidos válidos (HT, Q3, Q4)
+        # PASO 1: Verificar si hay partidos válidos (HT, Q3, Q4) Y FILTRO GARBAGE TIME
         partidos_validos = []
         for g in games.values():
             is_ht = "Half" in g["status"]
             is_q3_q4_live = (g["period"] in (3, 4) and g["state"] == "in")
-            if is_ht or is_q3_q4_live:
-                partidos_validos.append(g)
+            
+            if not (is_ht or is_q3_q4_live):
+                continue
+
+            # --- FILTRO ANTI GARBAGE TIME ---
+            if g["period"] == 4 and g["state"] == "in":
+                margen = abs(g["home_score"] - g["away_score"])
+                
+                min_faltan = 12.0
+                try:
+                    if ':' in g["clock"]:
+                        mm, ss = g["clock"].split(":")
+                        min_faltan = int(mm) + int(ss) / 60.0
+                    else:
+                        min_faltan = float(g["clock"])
+                        if min_faltan > 12.0: min_faltan = min_faltan / 60.0
+                except: pass
+                
+                if margen > 18 and min_faltan < 6.0:
+                    print(f"[GARBAGE TIME] {g['matchup']} | Margen: {margen} pts | Faltan {min_faltan:.1f} min. Se ignora.")
+                    continue
+            # ---------------------------------
+            
+            partidos_validos.append(g)
                 
         if not partidos_validos:
             return # No hay partidos válidos, no gastamos APIs
@@ -303,7 +330,6 @@ def poll():
         faltantes = [g for g in partidos_validos if g["matchup"] not in matched_odds]
         if faltantes:
             print(f"[PLAN B] InferSports falló o no tiene cuotas para {len(faltantes)} partidos. Usando TheOddsAPI...")
-            # Usamos la clave del primer usuario o la global si no hay
             api_key = users[0]["odds_key"] if users[0]["odds_key"] else THEODDS_API_KEY
             theodds_data = odds_totals_theoddsapi(api_key)
             
