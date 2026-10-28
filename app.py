@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot NBA - Multi-usuario (InferSports PRO + Respaldo TheOddsAPI + Filtro Garbage Time + Recency Bias)
+Bot NBA - Multi-usuario (InferSports PRO + Respaldo + Garbage Time + Recency Bias + Anchor Line)
 """
 import os, sqlite3, requests
 from datetime import datetime, timezone
@@ -10,15 +10,13 @@ from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
 
-POLL_INTERVAL = 120  # 2 minutos para ahorrar peticiones
+POLL_INTERVAL = 120  # 2 minutos
 MIN_DIFF = 7.0
 DB = "nba.db"
-ADMIN_PASS = "admin123"  # 👈 CAMBIA ESTO POR TU CONTRASEÑA SECRETA
+ADMIN_PASS = "admin123"  # 👈 CAMBIA ESTO
 
-# 🔑 AQUÍ VA TU CLAVE DE INFERSPORTS
+# 🔑 CLAVES
 INFER_API_KEY = "isk_sbSsZl0rFrEbscbN0NHb4_K_qEwfF5Kl" 
-
-# 🔑 AQUÍ VA TU CLAVE DE THEODDSAPI
 THEODDS_API_KEY = "2cc2dfc1b911c94ebd39d2909668831c"
 
 def db():
@@ -48,6 +46,9 @@ def init_db():
             total INTEGER, period INTEGER, created_at TEXT,
             status TEXT DEFAULT 'PENDING',
             final_total INTEGER);
+        CREATE TABLE IF NOT EXISTS anchors(
+            matchup TEXT PRIMARY KEY,
+            initial_line REAL);
         """)
         for col in ["auto_mode INTEGER DEFAULT 0", "is_blocked INTEGER DEFAULT 0"]:
             try: con.execute(f"ALTER TABLE users ADD COLUMN {col}")
@@ -71,7 +72,6 @@ def espn_games():
             at = away.get("team", {}).get("displayName", "Away")
             st = ev.get("status", {})
             
-            # EXTRAEMOS PUNTOS POR SEPARADO Y LOS CUARTOS PARA EL RECENCY BIAS
             q_home = home.get("linescores", [])
             q_away = away.get("linescores", [])
             home_score = sum(int(q.get("value", 0)) for q in q_home)
@@ -94,6 +94,17 @@ def espn_games():
         print(f"[espn] {e}")
         return []
 
+def get_anchor_line(con, matchup, current_line):
+    """Busca la línea ancla o la guarda si no existe"""
+    row = con.execute("SELECT initial_line FROM anchors WHERE matchup=?", (matchup,)).fetchone()
+    if row:
+        return row["initial_line"]
+    else:
+        # Si no existe, usamos la línea actual como ancla inicial
+        con.execute("INSERT INTO anchors(matchup, initial_line) VALUES(?,?)", (matchup, current_line))
+        con.commit()
+        return current_line
+
 def odds_totals_infer():
     try:
         headers = {
@@ -102,10 +113,7 @@ def odds_totals_infer():
             'Authorization': f'Bearer {INFER_API_KEY}'
         }
         r = requests.get("https://api.infersports.dev/v1/events/live", headers=headers, timeout=15)
-        
-        if r.status_code != 200:
-            print(f"[odds infer error] Status Code: {r.status_code} - {r.text[:100]}")
-            return {}
+        if r.status_code != 200: return {}
         
         data = r.json()
         eventos_infer = [ev for ev in data.get("data", []) if ev.get("sport") == "basketball" and ev.get("league", {}).get("name") == "NBA"]
@@ -128,8 +136,7 @@ def odds_totals_infer():
             for odd in odds_data.get("odds", []):
                 if odd.get("market_type") == "totals" and odd.get("period") == "full_time" and odd.get("status") == "open":
                     as_of_str = odd.get("as_of")
-                    try:
-                        as_of_time = datetime.fromisoformat(as_of_str.replace('Z', '+00:00'))
+                    try: as_of_time = datetime.fromisoformat(as_of_str.replace('Z', '+00:00'))
                     except: continue
                         
                     if mejor_time is None or as_of_time > mejor_time:
@@ -155,19 +162,13 @@ def odds_totals_infer():
 
 def odds_totals_theoddsapi(api_key):
     try:
-        r = requests.get(
-            "https://api.the-odds-api.com/v4/sports/basketball_nba/odds/",
-            params={"apiKey": api_key, "regions": "us",
-                    "markets": "totals", "oddsFormat": "decimal"},
-            timeout=15)
-        if r.status_code != 200:
-            print(f"[TheOddsAPI error] {r.status_code}")
-            return {}
+        r = requests.get("https://api.the-odds-api.com/v4/sports/basketball_nba/odds/", 
+            params={"apiKey": api_key, "regions": "us", "markets": "totals", "oddsFormat": "decimal"}, timeout=15)
+        if r.status_code != 200: return {}
         out = {}
         for m in r.json():
             matchup = f"{m['away_team']} vs {m['home_team']}"
-            bm = next((b for b in m.get("bookmakers", []) if b.get("key") == "pinnacle"), None) \
-                 or (m.get("bookmakers") or [None])[0]
+            bm = next((b for b in m.get("bookmakers", []) if b.get("key") == "pinnacle"), None) or (m.get("bookmakers") or [None])[0]
             if not bm: continue
             mk = next((x for x in bm.get("markets", []) if x.get("key") == "totals"), None)
             if not mk: continue
@@ -175,16 +176,10 @@ def odds_totals_theoddsapi(api_key):
             for o in mk.get("outcomes", []):
                 if "point" in o and "price" in o:
                     line = float(o["point"])
-                    if o.get("name", "").lower() == "over":
-                        over = float(o["price"])
-                    elif o.get("name", "").lower() == "under":
-                        under = float(o["price"])
+                    if o.get("name", "").lower() == "over": over = float(o["price"])
+                    elif o.get("name", "").lower() == "under": under = float(o["price"])
             if line is not None:
-                out[matchup] = {
-                    "line": line, "over": over, "under": under,
-                    "bookmaker": bm.get("title", "TheOddsAPI"),
-                    "age_min": 0.0
-                }
+                out[matchup] = {"line": line, "over": over, "under": under, "bookmaker": bm.get("title", "TheOddsAPI"), "age_min": 0.0}
         return out
     except Exception as e:
         print(f"[TheOddsAPI error] {e}")
@@ -213,32 +208,34 @@ def minutes_played(period, clock, status=""):
         except Exception: pass
     return mins
 
-def project_total_recency(total, minutes, period, q_home, q_away):
+def project_total_hibrida(total, minutes, period, q_home, q_away, anchor_line):
     if minutes <= 0.1: return None
     
-    # 1. Extraer los puntos por cuarto
+    # 1. Calcular Proyección en Vivo con Recency Bias
     q_pts = []
     for i in range(min(period - 1, len(q_home), len(q_away))):
-        try:
-            q_pts.append(int(q_home[i].get("value", 0)) + int(q_away[i].get("value", 0)))
+        try: q_pts.append(int(q_home[i].get("value", 0)) + int(q_away[i].get("value", 0)))
         except: pass
         
-    if not q_pts:
-        # Si no hay cuartos completos, usar proyección lineal base
+    if q_pts:
+        weights = list(range(1, len(q_pts) + 1))
+        weighted_sum = sum(p * w for p, w in zip(q_pts, weights))
+        total_weight = sum(weights)
+        avg_weighted = weighted_sum / total_weight
+        cuartos_restantes = 4 - len(q_pts)
+        live_proj = total + (avg_weighted * cuartos_restantes)
+    else:
         total_min = 48.0 if period <= 4 else 48.0 + (period - 4) * 5.0
-        return (total / minutes) * total_min
+        live_proj = (total / minutes) * total_min
 
-    # 2. Aplicar Recency Bias (Pesos: Q1=1, Q2=2, Q3=3...)
-    weights = list(range(1, len(q_pts) + 1))
-    weighted_sum = sum(p * w for p, w in zip(q_pts, weights))
-    total_weight = sum(weights)
-    avg_weighted = weighted_sum / total_weight
+    # 2. Mezclar con la Línea Ancla (Anchor Line)
+    # Al inicio del partido (Q1/Q2), pesa más el histórico (Anchor). En Q4, pesa más el en vivo.
+    weight_live = min(1.0, max(0.0, minutes / 48.0)) 
     
-    # 3. Proyección: Puntos actuales + (promedio ponderado * cuartos restantes)
-    cuartos_restantes = 4 - len(q_pts)
-    proyeccion = total + (avg_weighted * cuartos_restantes)
+    # Blend final
+    final_proj = (live_proj * weight_live) + (anchor_line * (1.0 - weight_live))
     
-    return proyeccion
+    return final_proj
 
 def send_tg(token, chat_id, msg):
     try:
@@ -302,7 +299,6 @@ def poll():
         games = {g["matchup"]: g for g in espn_games()}
         if not games: return
 
-        # PASO 1: Verificar partidos válidos + FILTRO GARBAGE TIME
         partidos_validos = []
         for g in games.values():
             is_ht = "Half" in g["status"]
@@ -311,10 +307,9 @@ def poll():
             if not (is_ht or is_q3_q4_live):
                 continue
 
-            # --- FILTRO ANTI GARBAGE TIME ---
+            # FILTRO ANTI GARBAGE TIME
             if g["period"] == 4 and g["state"] == "in":
                 margen = abs(g["home_score"] - g["away_score"])
-                
                 min_faltan = 12.0
                 try:
                     if ':' in g["clock"]:
@@ -328,12 +323,10 @@ def poll():
                 if margen > 18 and min_faltan < 6.0:
                     print(f"[GARBAGE TIME] {g['matchup']} | Margen: {margen} pts | Faltan {min_faltan:.1f} min. Se ignora.")
                     continue
-            # ---------------------------------
             
             partidos_validos.append(g)
                 
-        if not partidos_validos:
-            return
+        if not partidos_validos: return
 
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] --- INICIANDO REVISIÓN ({len(partidos_validos)} partidos válidos) ---")
         
@@ -382,21 +375,22 @@ def poll():
                             
                         mins = minutes_played(g["period"], g["clock"], g["status"])
                         
-                        # USAMOS LA NUEVA FUNCIÓN CON RECENCY BIAS
-                        proj = project_total_recency(g["total"], mins, g["period"], g["q_home"], g["q_away"])
+                        # OBTENER LÍNEA ANCLA
+                        with db() as con:
+                            anchor = get_anchor_line(con, matchup, ln["line"])
+                            
+                        # PROYECCIÓN HÍBRIDA
+                        proj = project_total_hibrida(g["total"], mins, g["period"], g["q_home"], g["q_away"], anchor)
                         
                         if proj is None: continue
                         diff = proj - ln["line"]
                         
-                        print(f"[EVAL AUTO] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} ({ln['bookmaker']}) | Diff: {diff:+.1f}")
+                        print(f"[EVAL AUTO] {matchup} | Anchor: {anchor:.1f} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
                         if abs(diff) < MIN_DIFF: continue
 
                         decision = "OVER" if diff > 0 else "UNDER"
                         cuota = ln["over"] if decision == "OVER" else ln["under"]
-                        
-                        # NUEVA CONFIANZA (Más agresiva en diferencias grandes)
                         conf = min(99, max(10, int((abs(diff) / 15) * 100 * (mins / 48))))
-                        
                         msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=True)
 
                         with db() as con:
@@ -430,18 +424,22 @@ def poll():
                             continue
                             
                         mins = minutes_played(g["period"], g["clock"], g["status"])
-                        proj = project_total_recency(g["total"], mins, g["period"], g["q_home"], g["q_away"])
+                        
+                        # OBTENER LÍNEA ANCLA
+                        with db() as con:
+                            anchor = get_anchor_line(con, matchup, ln["line"])
+                            
+                        proj = project_total_hibrida(g["total"], mins, g["period"], g["q_home"], g["q_away"], anchor)
                         
                         if proj is None: continue
                         diff = proj - ln["line"]
                         
-                        print(f"[EVAL MANUAL] {matchup} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} ({ln['bookmaker']}) | Diff: {diff:+.1f}")
+                        print(f"[EVAL MANUAL] {matchup} | Anchor: {anchor:.1f} | Proy: {proj:.1f} vs Línea: {ln['line']:.1f} | Diff: {diff:+.1f}")
                         if abs(diff) < MIN_DIFF: continue
 
                         decision = "OVER" if diff > 0 else "UNDER"
                         cuota = ln["over"] if decision == "OVER" else ln["under"]
                         conf = min(99, max(10, int((abs(diff) / 15) * 100 * (mins / 48))))
-                        
                         msg = format_signal(matchup, g, ln, decision, proj, diff, conf, auto=False)
 
                         with db() as con:
